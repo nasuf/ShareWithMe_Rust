@@ -1,0 +1,6 @@
+/target
+/node_modules
+/media
+share_with_me_store.json
+.env
+.env.*

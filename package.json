@@ -1,0 +1,12 @@
+{
+  "name": "share-with-me-backend-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render:extract": "node tools/render_extract.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.56.1"
+  }
+}
