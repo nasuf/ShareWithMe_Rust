@@ -1,7 +1,4 @@
-use std::{
-    env, fs,
-    sync::{Arc, Mutex},
-};
+use std::{env, fs, sync::Arc};
 
 use super::*;
 use crate::{
@@ -403,16 +400,13 @@ fn parses_weibo_visitor_jsonp_payload() {
     assert_eq!(value["data"]["subp"], "p");
 }
 
-#[test]
-fn persists_target_platform_items_after_parsing() {
+#[tokio::test]
+async fn persists_target_platform_items_after_parsing() {
     let path = env::temp_dir().join(format!(
         "share_with_me_platform_chain_{}.json",
         Uuid::new_v4()
     ));
-    let store = Arc::new(Mutex::new(Store {
-        path: path.clone(),
-        items: Vec::new(),
-    }));
+    let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
 
     let fixtures = [
         (
@@ -470,10 +464,12 @@ fn persists_target_platform_items_after_parsing() {
     ];
 
     for (url, platform, html, _, _) in fixtures.iter().copied() {
-        save_item(&store, parse_platform_fixture(url, platform, html)).expect("save item");
+        save_item(&store, parse_platform_fixture(url, platform, html))
+            .await
+            .expect("save item");
     }
 
-    let items = all_items(&store).expect("read items");
+    let items = all_items(&store).await.expect("read items");
     assert_eq!(items.len(), fixtures.len());
     for (_, platform, _, category, content_type) in fixtures.iter().copied() {
         let item = items

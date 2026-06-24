@@ -73,7 +73,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         analyzer_provider: "deepseek",
         deepseek_configured: state.config.deepseek_api_key.is_some(),
         deepseek_model: state.config.deepseek_model.clone(),
-        storage_path: state.config.storage_path.display().to_string(),
+        storage_path: state.config.storage_label(),
+        storage_backend: state.store.backend_name().to_string(),
     })
 }
 
@@ -112,7 +113,9 @@ async fn analyze_one_url(
     let metadata = extract_metadata(&state.http, source_url, request.shared_text.as_deref()).await;
     let analysis = analyze_with_deepseek_or_fallback(state, &metadata).await;
     let item = build_item(metadata, analysis, request.source_app.clone());
-    save_item(&state.store, item.clone()).map_err(ApiError::internal)?;
+    save_item(&state.store, item.clone())
+        .await
+        .map_err(ApiError::internal)?;
     Ok(item)
 }
 
@@ -121,6 +124,7 @@ async fn reanalyze_item(
     Path(id): Path<String>,
 ) -> Result<Json<LinkItem>, ApiError> {
     let current = find_item(&state.store, &id)
+        .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("item not found"))?;
     let metadata = LinkMetadata {
@@ -148,7 +152,9 @@ async fn reanalyze_item(
     updated.id = current.id;
     updated.created_at = current.created_at;
     updated.status = current.status;
-    save_item(&state.store, updated.clone()).map_err(ApiError::internal)?;
+    save_item(&state.store, updated.clone())
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(updated))
 }
 
@@ -158,6 +164,7 @@ async fn refresh_cover(
     Query(query): Query<RefreshCoverQuery>,
 ) -> Result<Json<LinkItem>, ApiError> {
     let current = find_item(&state.store, &id)
+        .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("item not found"))?;
     let now = Utc::now();
@@ -183,12 +190,14 @@ async fn refresh_cover(
                 Some(now),
                 now,
             )
+            .await
             .map_err(ApiError::internal)?;
             return Ok(Json(updated));
         }
     }
 
     let updated = update_item_cover(&state.store, &current.id, None, None, None, now)
+        .await
         .map_err(ApiError::internal)?;
     Ok(Json(updated))
 }
@@ -332,7 +341,7 @@ async fn list_items(
     State(state): State<AppState>,
     Query(query): Query<ListItemsQuery>,
 ) -> Result<Json<Vec<LinkItem>>, ApiError> {
-    let mut items = all_items(&state.store).map_err(ApiError::internal)?;
+    let mut items = all_items(&state.store).await.map_err(ApiError::internal)?;
     items.retain(|item| matches_filter(item, &query));
     sort_items(&mut items, query.sort.as_deref());
     Ok(Json(items))
@@ -343,6 +352,7 @@ async fn get_item(
     Path(id): Path<String>,
 ) -> Result<Json<LinkItem>, ApiError> {
     let item = find_item(&state.store, &id)
+        .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("item not found"))?;
     Ok(Json(item))
@@ -352,7 +362,10 @@ async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if !delete_item_by_id(&state.store, &id).map_err(ApiError::internal)? {
+    if !delete_item_by_id(&state.store, &id)
+        .await
+        .map_err(ApiError::internal)?
+    {
         return Err(ApiError::not_found("item not found"));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -369,7 +382,9 @@ async fn update_status(
             "status must be active, archived, or favorite",
         ));
     }
-    update_item_status(&state.store, &id, &request.status).map_err(ApiError::internal)?;
+    update_item_status(&state.store, &id, &request.status)
+        .await
+        .map_err(ApiError::internal)?;
     get_item(State(state), Path(id)).await
 }
 
@@ -379,13 +394,15 @@ async fn update_item(
     Json(request): Json<UpdateItemRequest>,
 ) -> Result<Json<LinkItem>, ApiError> {
     let request = normalize_update_request(request)?;
-    let item = update_item_metadata(&state.store, &id, request).map_err(|error| {
-        if error.to_string().contains("item not found") {
-            ApiError::not_found("item not found")
-        } else {
-            ApiError::internal(error)
-        }
-    })?;
+    let item = update_item_metadata(&state.store, &id, request)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("item not found") {
+                ApiError::not_found("item not found")
+            } else {
+                ApiError::internal(error)
+            }
+        })?;
     Ok(Json(item))
 }
 
@@ -393,7 +410,7 @@ async fn stats(
     State(state): State<AppState>,
     Query(query): Query<ListItemsQuery>,
 ) -> Result<Json<CollectionStats>, ApiError> {
-    let mut items = all_items(&state.store).map_err(ApiError::internal)?;
+    let mut items = all_items(&state.store).await.map_err(ApiError::internal)?;
     items.retain(|item| matches_filter(item, &query));
     let categories = count_by(items.iter().map(|item| item.category.clone()));
     let platforms = count_by(items.iter().map(|item| item.platform.clone()));
@@ -438,12 +455,12 @@ fn normalize_update_request(mut request: UpdateItemRequest) -> Result<UpdateItem
 }
 
 async fn digest(State(state): State<AppState>) -> Result<Json<CollectionDigest>, ApiError> {
-    let items = all_items(&state.store).map_err(ApiError::internal)?;
+    let items = all_items(&state.store).await.map_err(ApiError::internal)?;
     Ok(Json(collection_digest(&items)))
 }
 
 async fn export_markdown(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let items = all_items(&state.store).map_err(ApiError::internal)?;
+    let items = all_items(&state.store).await.map_err(ApiError::internal)?;
     let markdown = build_markdown_export(&items);
     Ok((
         [
@@ -458,7 +475,7 @@ async fn export_markdown(State(state): State<AppState>) -> Result<impl IntoRespo
 }
 
 async fn export_json(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let items = all_items(&state.store).map_err(ApiError::internal)?;
+    let items = all_items(&state.store).await.map_err(ApiError::internal)?;
     let body = serde_json::to_string_pretty(&build_json_export(items))
         .map_err(|error| ApiError::internal(error.into()))?;
     Ok((
@@ -479,9 +496,13 @@ async fn import_json(
 ) -> Result<Json<JsonImportResponse>, ApiError> {
     let request = validate_json_import(request)?;
     let imported_count = request.items.len();
-    let (created_count, merged_count) =
-        import_items(&state.store, request.items).map_err(ApiError::internal)?;
-    let total_count = all_items(&state.store).map_err(ApiError::internal)?.len();
+    let (created_count, merged_count) = import_items(&state.store, request.items)
+        .await
+        .map_err(ApiError::internal)?;
+    let total_count = all_items(&state.store)
+        .await
+        .map_err(ApiError::internal)?
+        .len();
     Ok(Json(JsonImportResponse {
         imported_count,
         created_count,

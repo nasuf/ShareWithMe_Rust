@@ -95,6 +95,7 @@ pub(crate) struct HealthResponse {
     pub(crate) deepseek_configured: bool,
     pub(crate) deepseek_model: String,
     pub(crate) storage_path: String,
+    pub(crate) storage_backend: String,
 }
 
 #[derive(Debug, Serialize)]

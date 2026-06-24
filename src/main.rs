@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use reqwest::{Client, redirect::Policy};
@@ -24,11 +21,12 @@ use store::Store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::from_filename("../.env").ok();
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let config = Arc::new(AppConfig::from_env()?);
-    let store = Store::load(config.storage_path.clone())?;
+    let store = Store::load(&config).await?;
 
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(8))
@@ -39,7 +37,7 @@ async fn main() -> Result<()> {
         .context("build http client")?;
 
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::new(store),
         http,
         config: Arc::clone(&config),
     };
@@ -55,10 +53,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use std::{
-        env, fs,
-        sync::{Arc, Mutex},
-    };
+    use std::{env, fs, sync::Arc};
     use uuid::Uuid;
 
     use crate::{
@@ -202,21 +197,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn store_deduplicates_by_final_url() {
+    #[tokio::test]
+    async fn store_deduplicates_by_final_url() {
         let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
-        let store = Arc::new(Mutex::new(Store {
-            path: path.clone(),
-            items: Vec::new(),
-        }));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
 
         let first = test_item("first-id", "https://example.com/a", "First title");
         let second = test_item("second-id", "https://example.com/a", "Second title");
 
-        save_item(&store, first).expect("save first");
-        save_item(&store, second).expect("save second");
+        save_item(&store, first).await.expect("save first");
+        save_item(&store, second).await.expect("save second");
 
-        let items = all_items(&store).expect("read items");
+        let items = all_items(&store).await.expect("read items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "first-id");
         assert_eq!(items[0].title, "Second title");
@@ -224,21 +216,20 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[test]
-    fn import_items_merges_existing_final_urls() {
+    #[tokio::test]
+    async fn import_items_merges_existing_final_urls() {
         let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
-        let store = Arc::new(Mutex::new(Store {
-            path: path.clone(),
-            items: Vec::new(),
-        }));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
 
         let original = test_item("original-id", "https://example.com/a", "Original");
         let imported = test_item("imported-id", "https://example.com/a", "Imported");
 
-        save_item(&store, original).expect("save original");
-        let (created, merged) = import_items(&store, vec![imported]).expect("import items");
+        save_item(&store, original).await.expect("save original");
+        let (created, merged) = import_items(&store, vec![imported])
+            .await
+            .expect("import items");
 
-        let items = all_items(&store).expect("read items");
+        let items = all_items(&store).await.expect("read items");
         assert_eq!((created, merged), (0, 1));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "original-id");
@@ -247,16 +238,13 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[test]
-    fn updates_user_editable_item_metadata() {
+    #[tokio::test]
+    async fn updates_user_editable_item_metadata() {
         let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
-        let store = Arc::new(Mutex::new(Store {
-            path: path.clone(),
-            items: Vec::new(),
-        }));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
         let item = test_item("manual-edit", "https://example.com/a", "Original");
         let original_updated_at = item.updated_at;
-        save_item(&store, item).expect("save item");
+        save_item(&store, item).await.expect("save item");
 
         let updated = update_item_metadata(
             &store,
@@ -267,6 +255,7 @@ mod tests {
                 notes: Some("周末整理".to_string()),
             },
         )
+        .await
         .expect("update item");
 
         assert_eq!(updated.category, "旅行");
@@ -274,7 +263,7 @@ mod tests {
         assert_eq!(updated.notes, "周末整理");
         assert!(updated.updated_at >= original_updated_at);
 
-        let persisted = all_items(&store).expect("read items");
+        let persisted = all_items(&store).await.expect("read items");
         assert_eq!(persisted[0].category, "旅行");
 
         let _ = fs::remove_file(path);

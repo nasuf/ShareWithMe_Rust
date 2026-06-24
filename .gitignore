@@ -4,3 +4,4 @@
 share_with_me_store.json
 .env
 .env.*
+!.env.example

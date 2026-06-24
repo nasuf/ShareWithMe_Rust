@@ -1,0 +1,142 @@
+name: Backend CI and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_DIR: ${{ vars.RACKNERD_APP_DIR || '/opt/sharewithme/backend' }}
+  SERVICE_NAME: ${{ vars.RACKNERD_SERVICE_NAME || 'sharewithme-backend' }}
+  SHARE_WITH_ME_BIND: ${{ vars.SHARE_WITH_ME_BIND || '0.0.0.0:8080' }}
+
+jobs:
+  test:
+    name: Test backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: cargo fmt --check
+
+      - run: cargo clippy --all-targets -- -D warnings
+
+      - run: cargo test --locked
+
+  deploy:
+    name: Deploy to RackNerd
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: cargo build --release --locked
+
+      - name: Prepare release bundle
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/tools dist/schema
+          cp target/release/backend dist/sharewithme-backend
+          cp package.json package-lock.json dist/
+          cp tools/render_extract.mjs dist/tools/
+          cp schema/sharewithme.sql dist/schema/
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.RACKNERD_SSH_KEY }}
+
+      - name: Trust RackNerd host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.RACKNERD_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload release bundle
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}" "mkdir -p '${APP_DIR}'"
+          rsync -az --delete dist/ "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}:${APP_DIR}/"
+
+      - name: Install service and restart
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/chat/completions' }}
+          DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-v4-flash' }}
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}" \
+            "APP_DIR='${APP_DIR}' SERVICE_NAME='${SERVICE_NAME}' SHARE_WITH_ME_BIND='${SHARE_WITH_ME_BIND}' \
+             DEEPSEEK_API_KEY='${DEEPSEEK_API_KEY}' DEEPSEEK_BASE_URL='${DEEPSEEK_BASE_URL}' \
+             DEEPSEEK_MODEL='${DEEPSEEK_MODEL}' SUPABASE_DATABASE_URL='${SUPABASE_DATABASE_URL}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "$APP_DIR"
+          chmod +x sharewithme-backend
+          npm ci --omit=dev
+
+          cat > .env <<ENV
+          SHARE_WITH_ME_BIND=$SHARE_WITH_ME_BIND
+          SHARE_WITH_ME_STORE_BACKEND=supabase
+          SHARE_WITH_ME_MEDIA=$APP_DIR/media
+          SHARE_WITH_ME_RENDERER=$APP_DIR/tools/render_extract.mjs
+          DEEPSEEK_BASE_URL=$DEEPSEEK_BASE_URL
+          DEEPSEEK_MODEL=$DEEPSEEK_MODEL
+          DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY
+          SUPABASE_DATABASE_URL=$SUPABASE_DATABASE_URL
+          ENV
+          chmod 600 .env
+
+          if command -v apt-get >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y chromium || apt-get install -y chromium-browser
+          fi
+
+          cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SERVICE
+          [Unit]
+          Description=ShareWithMe backend
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=$APP_DIR
+          EnvironmentFile=$APP_DIR/.env
+          ExecStart=$APP_DIR/sharewithme-backend
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          systemctl daemon-reload
+          systemctl enable "$SERVICE_NAME"
+          systemctl restart "$SERVICE_NAME"
+          systemctl --no-pager --full status "$SERVICE_NAME"
+          REMOTE

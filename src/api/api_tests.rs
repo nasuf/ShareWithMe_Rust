@@ -1,8 +1,4 @@
-use std::{
-    io::Cursor,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{io::Cursor, net::SocketAddr, sync::Arc};
 
 use axum::extract::{Path, Query, State};
 use chrono::Utc;
@@ -15,7 +11,11 @@ use tokio::{
 use uuid::Uuid;
 
 use super::*;
-use crate::{config::AppConfig, models::LinkItem, store::Store};
+use crate::{
+    config::{AppConfig, StoreConfig},
+    models::LinkItem,
+    store::Store,
+};
 
 #[tokio::test]
 async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
@@ -51,16 +51,15 @@ async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
         created_at: now,
         updated_at: now,
     };
-    let store = Arc::new(Mutex::new(Store {
-        path: store_path.clone(),
-        items: vec![item],
-    }));
+    let store = Arc::new(Store::local_for_tests(store_path.clone(), vec![item]));
     let state = AppState {
         store,
         http: test_http_client(),
         config: Arc::new(AppConfig {
             bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            storage_path: store_path.clone(),
+            store: StoreConfig::Local {
+                path: store_path.clone(),
+            },
             media_path: media_path.clone(),
             deepseek_api_key: None,
             deepseek_base_url: "https://api.deepseek.com/chat/completions".to_string(),
