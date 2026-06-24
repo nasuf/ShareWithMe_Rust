@@ -8,9 +8,7 @@ use std::str::FromStr;
 use crate::models::LinkItem;
 
 const SCHEMA_SQL: &str = r#"
-create schema if not exists sharewithme;
-
-create table if not exists sharewithme.items (
+create table if not exists public.items (
     id text primary key,
     final_url text not null unique,
     item jsonb not null,
@@ -19,11 +17,11 @@ create table if not exists sharewithme.items (
     updated_at timestamptz not null
 );
 
-create index if not exists items_created_at_idx on sharewithme.items (created_at desc);
-create index if not exists items_status_idx on sharewithme.items (status);
-create index if not exists items_item_gin_idx on sharewithme.items using gin (item);
+create index if not exists sharewithme_items_created_at_idx on public.items (created_at desc);
+create index if not exists sharewithme_items_status_idx on public.items (status);
+create index if not exists sharewithme_items_item_gin_idx on public.items using gin (item);
 
-alter table sharewithme.items enable row level security;
+alter table public.items enable row level security;
 "#;
 
 #[derive(Clone)]
@@ -56,7 +54,7 @@ impl SupabaseStore {
 
     pub(super) async fn all_items(&self) -> Result<Vec<LinkItem>> {
         let rows = sqlx::query(
-            "select item from sharewithme.items order by created_at desc, item->>'title' asc",
+            "select item from public.items order by created_at desc, item->>'title' asc",
         )
         .fetch_all(&self.pool)
         .await
@@ -81,7 +79,7 @@ impl SupabaseStore {
     }
 
     pub(super) async fn find_item(&self, id: &str) -> Result<Option<LinkItem>> {
-        let row = sqlx::query("select item from sharewithme.items where id = $1")
+        let row = sqlx::query("select item from public.items where id = $1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -90,7 +88,7 @@ impl SupabaseStore {
     }
 
     pub(super) async fn delete_item_by_id(&self, id: &str) -> Result<bool> {
-        let result = sqlx::query("delete from sharewithme.items where id = $1")
+        let result = sqlx::query("delete from public.items where id = $1")
             .bind(id)
             .execute(&self.pool)
             .await
@@ -119,11 +117,11 @@ impl SupabaseStore {
 
     async fn verify_schema(&self) -> Result<()> {
         sqlx::query(
-            "select id, final_url, item, status, created_at, updated_at from sharewithme.items limit 0",
+            "select id, final_url, item, status, created_at, updated_at from public.items limit 0",
         )
         .execute(&self.pool)
         .await
-        .context("verify Supabase sharewithme.items schema")?;
+        .context("verify Supabase public.items schema")?;
         Ok(())
     }
 
@@ -131,7 +129,7 @@ impl SupabaseStore {
         let row = sqlx::query(
             r#"
             select id, created_at
-            from sharewithme.items
+            from public.items
             where id = $1 or final_url = $2
             order by case when id = $1 then 0 else 1 end
             limit 1
@@ -156,7 +154,7 @@ impl SupabaseStore {
         let json = serde_json::to_value(item).context("serialize LinkItem for Supabase")?;
         sqlx::query(
             r#"
-            insert into sharewithme.items (id, final_url, item, status, created_at, updated_at)
+            insert into public.items (id, final_url, item, status, created_at, updated_at)
             values ($1, $2, $3, $4, $5, $6)
             on conflict (id) do update set
                 final_url = excluded.final_url,

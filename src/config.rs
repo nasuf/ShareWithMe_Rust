@@ -51,7 +51,7 @@ impl AppConfig {
     pub(crate) fn storage_label(&self) -> String {
         match &self.store {
             StoreConfig::Local { path } => format!("local:{}", path.display()),
-            StoreConfig::Supabase { .. } => "supabase:sharewithme.items".to_string(),
+            StoreConfig::Supabase { .. } => "supabase:public.items".to_string(),
         }
     }
 }

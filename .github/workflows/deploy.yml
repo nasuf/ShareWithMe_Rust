@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  APP_DIR: ${{ vars.RACKNERD_APP_DIR || '/opt/sharewithme/backend' }}
+  APP_DIR: ${{ vars.RACKNERD_APP_DIR || '/app' }}
   SERVICE_NAME: ${{ vars.RACKNERD_SERVICE_NAME || 'sharewithme-backend' }}
   SHARE_WITH_ME_BIND: ${{ vars.SHARE_WITH_ME_BIND || '0.0.0.0:8080' }}
 
