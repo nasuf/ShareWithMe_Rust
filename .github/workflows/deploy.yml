@@ -14,7 +14,7 @@ env:
 jobs:
   test:
     name: Test backend
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +37,7 @@ jobs:
 
   deploy:
     name: Deploy to RackNerd
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: test
     if: github.ref == 'refs/heads/main'
     steps:
