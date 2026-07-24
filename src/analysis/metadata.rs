@@ -9,7 +9,9 @@ use crate::{
     render::{RenderedPage, render_extract},
 };
 
-use super::adapters::{enrich_from_html, enrich_remote, merge_xiaohongshu_metadata};
+use super::adapters::{
+    enrich_from_html, enrich_remote, merge_wechat_metadata, merge_xiaohongshu_metadata,
+};
 use super::classify::{
     clean_original_text, clean_text, first_meaningful_line, first_non_empty,
     is_blocked_without_content, is_url_only_text, plain_text_preview, platform_for_url,
@@ -65,7 +67,11 @@ pub(crate) async fn extract_metadata_with_video_transcription(
         },
     };
 
-    match http.get(source_url).send().await {
+    let mut request = http.get(source_url);
+    if let Some(user_agent) = fetch_user_agent(source_url) {
+        request = request.header("user-agent", user_agent);
+    }
+    match request.send().await {
         Ok(response) => {
             metadata.final_url = response.url().to_string();
             metadata.platform = platform_for_url(&metadata.final_url);
@@ -113,6 +119,16 @@ pub(crate) async fn extract_metadata_with_video_transcription(
     }
     finalize_metadata(&mut metadata, fetched_at);
     metadata
+}
+
+// WeChat serves an "环境异常" verification wall to non-browser user agents.
+// A mobile Safari UA returns the real article HTML (server-rendered `#js_content`
+// or `window.cgiData`), so the direct path can work without a headless browser.
+fn fetch_user_agent(source_url: &str) -> Option<&'static str> {
+    source_url.contains("mp.weixin.qq.com").then_some(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 \
+         (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    )
 }
 
 fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
@@ -345,6 +361,10 @@ pub(super) fn merge_html_metadata(metadata: &mut LinkMetadata, html: &str) {
         metadata.extraction.method = "embedded-state".to_string();
         return;
     }
+    if merge_wechat_metadata(metadata, html) {
+        metadata.extraction.method = "wechat-article".to_string();
+        return;
+    }
     if merge_platform_state_metadata(metadata, html) {
         metadata.extraction.method = "embedded-state".to_string();
         return;
@@ -457,6 +477,14 @@ fn access_block_reason(html: &str, platform: &str) -> Option<String> {
                 .to_string(),
         );
     }
+    if platform == "微信公众号"
+        && (html.contains("环境异常") || html.contains("去验证") || html.contains("完成验证"))
+    {
+        return Some(
+            "微信公众号返回了环境异常验证页面，正在尝试浏览器渲染兜底；若仍失败可从原文分享带正文的文本。"
+                .to_string(),
+        );
+    }
     if lower.contains("zh-zse-ck") || lower.contains("zse-ck") {
         return Some(
             "知乎返回了访问验证页面，后端无法从普通网页直接抓取正文，正在尝试回答接口兜底。"
@@ -487,7 +515,15 @@ pub(super) fn should_try_rendered_extraction(metadata: &LinkMetadata) -> bool {
     {
         return false;
     }
-    matches!(metadata.platform.as_str(), "今日头条" | "小红书") && text_len < 120
+    // A WeChat article that already carries a definitive "deleted/unavailable"
+    // reason must not be re-fetched by the browser (that would overwrite it).
+    if metadata.platform == "微信公众号" && metadata.extraction.last_error.is_some() {
+        return false;
+    }
+    matches!(
+        metadata.platform.as_str(),
+        "今日头条" | "小红书" | "微信公众号"
+    ) && text_len < 120
 }
 
 pub(super) fn merge_rendered_metadata(metadata: &mut LinkMetadata, rendered: RenderedPage) {

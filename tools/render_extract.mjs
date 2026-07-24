@@ -73,6 +73,8 @@ async function extractPage(url) {
       function bestDomText() {
         const selectors = [
           'article',
+          '#js_content',
+          '.rich_media_content',
           '.syl-page-article',
           '.article-content',
           '.article-detail-container',
@@ -115,7 +117,38 @@ async function extractPage(url) {
         return null;
       }
 
+      function wechatArticle() {
+        const body = document.querySelector('#js_content');
+        if (!body) return null;
+        const title = clean(
+          document.querySelector('#activity-name')?.innerText ||
+            meta('meta[property="og:title"]') ||
+            document.title,
+          4000
+        );
+        const author = clean(
+          document.querySelector('#js_name')?.innerText ||
+            document.querySelector('.profile_nickname')?.innerText ||
+            '',
+          4000
+        );
+        return {
+          ok: true,
+          finalUrl: location.href,
+          title,
+          description: clean(meta('meta[property="og:description"]') || meta('meta[name="description"]'), 4000),
+          author,
+          imageUrl: meta('meta[property="og:image"]') || '',
+          contentText: clean(body.innerText || ''),
+          extractor: 'wechat-render'
+        };
+      }
+
       const ld = jsonLd();
+      const wechat = wechatArticle();
+      if (wechat && wechat.contentText.length >= 80) {
+        return wechat;
+      }
       const xhsNote = xhsNoteFromState();
       if (xhsNote) {
         const image = xhsNote.imageList?.[0]?.urlDefault || xhsNote.imageList?.[0]?.urlPre || '';

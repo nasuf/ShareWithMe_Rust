@@ -22,6 +22,7 @@ strict_urls=(
   'https://ditu.amap.com/place/B000A8UIN8'
   'https://item.jd.com/10203710219600.html'
   'https://weread.qq.com/web/bookDetail/02932980813ab7a43g012e77'
+  'https://mp.weixin.qq.com/s/s4xrYzArVrkhEAfvvhR01Q'
 )
 
 youtube_url='https://www.youtube.com/watch?v=dQw4w9WgXcQ'

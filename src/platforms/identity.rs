@@ -59,6 +59,7 @@ pub(crate) fn source_identity(raw_url: &str, platform: &str) -> SourceIdentity {
         "淘宝" => commerce_query_identity(&url, "https://item.taobao.com/item.htm?id="),
         "天猫" => commerce_query_identity(&url, "https://detail.tmall.com/item.htm?id="),
         "微信读书" => weread_identity(&url, &segments),
+        "微信公众号" => wechat_identity(&url, &segments),
         _ => None,
     };
 
@@ -171,6 +172,28 @@ fn commerce_query_identity(url: &Url, prefix: &str) -> Option<(String, String)> 
     Some((id.clone(), format!("{prefix}{id}")))
 }
 
+fn wechat_identity(url: &Url, segments: &[&str]) -> Option<(String, String)> {
+    // Short form: https://mp.weixin.qq.com/s/<token>
+    if let Some(token) = id_after(segments, &["s"]) {
+        return Some((token.clone(), format!("https://mp.weixin.qq.com/s/{token}")));
+    }
+    // Query form: https://mp.weixin.qq.com/s?__biz=..&mid=..&idx=..&sn=..
+    // `sn` uniquely identifies the article; keep the stable addressing params and
+    // drop volatile tracking (chksm, scene, key, ...).
+    let sn = query_value(url, &["sn"])?;
+    let canonical = match (
+        query_value(url, &["__biz"]),
+        query_value(url, &["mid"]),
+        query_value(url, &["idx"]),
+    ) {
+        (Some(biz), Some(mid), Some(idx)) => {
+            format!("https://mp.weixin.qq.com/s?__biz={biz}&mid={mid}&idx={idx}&sn={sn}")
+        }
+        _ => format!("https://mp.weixin.qq.com/s?sn={sn}"),
+    };
+    Some((sn, canonical))
+}
+
 fn weread_identity(url: &Url, segments: &[&str]) -> Option<(String, String)> {
     let id =
         id_after(segments, &["bookDetail"]).or_else(|| query_value(url, &["bookId", "bookid"]))?;
@@ -264,6 +287,18 @@ mod tests {
                 "百度地图",
                 "https://map.baidu.com/?uid=435d7aea036e54355abbbcc8",
                 "435d7aea036e54355abbbcc8",
+            ),
+            (
+                "https://mp.weixin.qq.com/s/s4xrYzArVrkhEAfvvhR01Q?from=timeline",
+                "微信公众号",
+                "https://mp.weixin.qq.com/s/s4xrYzArVrkhEAfvvhR01Q",
+                "s4xrYzArVrkhEAfvvhR01Q",
+            ),
+            (
+                "https://mp.weixin.qq.com/s?__biz=MzA5&mid=2650&idx=1&sn=abcdef&chksm=xyz&scene=27",
+                "微信公众号",
+                "https://mp.weixin.qq.com/s?__biz=MzA5&mid=2650&idx=1&sn=abcdef",
+                "abcdef",
             ),
         ];
 

@@ -25,6 +25,7 @@ AI output, and the next refresh time.
 | 淘宝 | Product structured data when public | Product title/specification/media when exposed | System share-sheet title/specification is the reliable path under login/risk control | 12 h |
 | 天猫 | Product structured data when public | Product title/specification/media when exposed | System share-sheet title/specification is the reliable path under login/risk control | 12 h |
 | 微信读书 | Public book detail HTML and structured data | Book title, author, introduction and cover | Share-sheet book text | 72 h |
+| 微信公众号 | Server-rendered `#js_content` or inline `cgiData` | Article/picture-message body blocks, account, author, publish time and images | Browser render, then share-sheet text | 24 h |
 
 ## Video speech
 
@@ -74,7 +75,7 @@ cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Run live public-source contracts for all 16 target platforms:
+Run live public-source contracts for all 17 target platforms:
 
 ```bash
 scripts/live_platform_probe.sh

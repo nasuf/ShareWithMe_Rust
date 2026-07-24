@@ -4,12 +4,14 @@ mod maps;
 mod oembed;
 mod structured;
 mod video;
+mod wechat;
 mod xiaohongshu;
 
 use reqwest::Client;
 
 use crate::models::LinkMetadata;
 
+pub(super) use wechat::merge as merge_wechat_metadata;
 pub(super) use xiaohongshu::merge as merge_xiaohongshu_metadata;
 
 pub(super) fn enrich_from_html(metadata: &mut LinkMetadata, html: &str) {

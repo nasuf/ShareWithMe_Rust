@@ -35,6 +35,7 @@ pub(crate) fn profile_for(platform: &str) -> PlatformProfile {
         "淘宝" => profile("taobao", "product", 12),
         "天猫" => profile("tmall", "product", 12),
         "微信读书" => profile("weread", "book", 72),
+        "微信公众号" => profile("wechat_oa", "article", 24),
         _ => profile("generic", "link", 72),
     }
 }

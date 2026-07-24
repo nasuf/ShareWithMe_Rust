@@ -15,6 +15,16 @@ pub(super) fn document_from_html(
     let Some(root) = content_root(document) else {
         return (OriginalContent::default(), Vec::new());
     };
+    document_from_root(root, base_url)
+}
+
+// Extract semantic blocks and media from a specific root element. Dedicated
+// adapters (e.g. WeChat `#js_content`) reuse this so lazy-image and block logic
+// stays in one place.
+pub(super) fn document_from_root(
+    root: ElementRef<'_>,
+    base_url: &str,
+) -> (OriginalContent, Vec<MediaAsset>) {
     let selector = Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li,img").ok();
     let mut blocks = Vec::new();
     let mut media = Vec::new();
@@ -115,9 +125,17 @@ fn content_root(document: &Html) -> Option<ElementRef<'_>> {
 }
 
 fn image_asset(element: &ElementRef<'_>, base_url: &str) -> Option<MediaAsset> {
-    let raw_url = ["data-src", "data-original", "src"]
+    // `data-src` / `data-croporisrc` cover WeChat and other lazy-loaded images
+    // whose real URL is not in the placeholder `src`.
+    let raw_url = ["data-src", "data-croporisrc", "data-original", "src"]
         .iter()
-        .find_map(|name| element.value().attr(name))?
+        .find_map(|name| {
+            element
+                .value()
+                .attr(name)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?
         .trim();
     let url = absolute_url(base_url, raw_url)?;
     if url.starts_with("data:") || url.ends_with(".svg") {
