@@ -1,21 +1,26 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use reqwest::{Client, redirect::Policy};
+use reqwest::Client;
 use tracing::info;
 
 mod analysis;
 mod api;
 mod config;
+mod content;
 mod digest;
 mod error;
 mod models;
+mod network;
+mod platforms;
+mod probe;
 mod render;
 mod state;
 mod store;
 
 use api::build_router;
 use config::AppConfig;
+use network::safe_redirect_policy;
 use state::AppState;
 use store::Store;
 
@@ -25,13 +30,32 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "--probe-shared" | "--probe-shared-strict"
+        )
+    }) {
+        if args.len() != 3 {
+            anyhow::bail!("usage: backend --probe-shared[-strict] <url> <shared text>");
+        }
+        return probe::run_shared(&args[1], &args[2], args[0] == "--probe-shared-strict").await;
+    }
+    if args
+        .first()
+        .is_some_and(|argument| matches!(argument.as_str(), "--probe" | "--probe-strict"))
+    {
+        return probe::run(&args[1..], args[0] == "--probe-strict").await;
+    }
+
     let config = Arc::new(AppConfig::from_env()?);
     let store = Store::load(&config).await?;
 
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(22))
-        .redirect(Policy::limited(8))
+        .redirect(safe_redirect_policy(8))
         .user_agent("ShareWithMe/0.1 (+personal link organizer)")
         .build()
         .context("build http client")?;
@@ -58,7 +82,8 @@ mod tests {
 
     use crate::{
         analysis::{
-            extract_first_url, extract_urls, infer_category, infer_content_type, platform_for_url,
+            extract_first_url, extract_urls, infer_category, infer_content_type,
+            is_safe_remote_url, platform_for_url,
         },
         api::{build_json_export, build_markdown_export, matches_filter, sort_items},
         digest::collection_digest,
@@ -93,6 +118,18 @@ mod tests {
             Some("https://m.tb.cn/h.abc123?tk=abcd".to_string())
         );
         assert_eq!(
+            extract_first_url("京东分享 3.cn/abc123 复制打开"),
+            Some("https://3.cn/abc123".to_string())
+        );
+        assert_eq!(
+            extract_first_url("X 帖子 t.co/abc123"),
+            Some("https://t.co/abc123".to_string())
+        );
+        assert_eq!(
+            extract_first_url("高德位置 uri.amap.com/marker?position=116,39"),
+            Some("https://uri.amap.com/marker?position=116,39".to_string())
+        );
+        assert_eq!(
             extract_first_url("资料在 pan.baidu.com/s/abc123 提取码 test"),
             Some("https://pan.baidu.com/s/abc123".to_string())
         );
@@ -116,6 +153,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_private_and_local_source_urls() {
+        for url in [
+            "http://localhost:8080/private",
+            "http://192.168.1.1/admin",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/private",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_safe_remote_url(&url::Url::parse(url).unwrap()), "{url}");
+        }
+        assert!(is_safe_remote_url(
+            &url::Url::parse("https://www.xiaohongshu.com/explore/abc").unwrap()
+        ));
+    }
+
+    #[test]
     fn maps_common_platforms() {
         let cases = [
             ("https://xhslink.com/a/b", "小红书"),
@@ -132,7 +185,11 @@ mod tests {
             ("https://music.163.com/song?id=1", "网易云音乐"),
             ("https://docs.google.com/document/d/1", "Google Docs/Drive"),
             ("https://pan.baidu.com/s/abc", "百度网盘"),
-            ("https://m.tb.cn/h.abc123", "淘宝/天猫"),
+            ("https://m.tb.cn/h.abc123", "淘宝"),
+            ("https://detail.tmall.com/item.htm?id=1", "天猫"),
+            ("https://map.baidu.com/?uid=1", "百度地图"),
+            ("https://weread.qq.com/web/bookDetail/abc", "微信读书"),
+            ("https://x.com/OpenAI/status/1", "X"),
         ];
 
         for (url, expected) in cases {
@@ -144,7 +201,7 @@ mod tests {
     fn infers_categories_for_specialized_sources() {
         assert_eq!(infer_category("上海咖啡店 地图 导航", "高德地图"), "地点");
         assert_eq!(infer_category("Rust API 架构设计", "GitHub"), "技术");
-        assert_eq!(infer_category("双十一优惠券 商品下单", "淘宝/天猫"), "购物");
+        assert_eq!(infer_category("双十一优惠券 商品下单", "淘宝"), "购物");
         assert_eq!(infer_category("播客 专辑 音乐", "小宇宙"), "影音娱乐");
         assert_eq!(infer_category("项目文档 Notion 资料", "Notion"), "文档资料");
         assert_eq!(infer_category("资料链接 提取码", "百度网盘"), "文档资料");
@@ -437,6 +494,13 @@ mod tests {
             cover_checked_at: None,
             content_text: String::new(),
             original_text: String::new(),
+            shared_text: String::new(),
+            original_content: Default::default(),
+            media: Vec::new(),
+            source_facts: Vec::new(),
+            source_id: None,
+            published_at: None,
+            extraction: Default::default(),
             summary: title.to_string(),
             category: "待整理".to_string(),
             keywords: vec![],
@@ -445,6 +509,7 @@ mod tests {
             content_type: "link".to_string(),
             importance_score: 50,
             notes: String::new(),
+            user_edited_at: None,
             status: "active".to_string(),
             created_at: now,
             updated_at: now,

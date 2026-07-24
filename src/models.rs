@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::content::{ExtractionState, MediaAsset, OriginalContent, SourceFact};
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnalyzeLinkRequest {
     pub(crate) url: Option<String>,
@@ -49,6 +51,20 @@ pub(crate) struct LinkItem {
     pub(crate) content_text: String,
     #[serde(default)]
     pub(crate) original_text: String,
+    #[serde(default)]
+    pub(crate) shared_text: String,
+    #[serde(default)]
+    pub(crate) original_content: OriginalContent,
+    #[serde(default)]
+    pub(crate) media: Vec<MediaAsset>,
+    #[serde(default)]
+    pub(crate) source_facts: Vec<SourceFact>,
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    #[serde(default)]
+    pub(crate) published_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) extraction: ExtractionState,
     pub(crate) summary: String,
     pub(crate) category: String,
     pub(crate) keywords: Vec<String>,
@@ -57,12 +73,14 @@ pub(crate) struct LinkItem {
     pub(crate) content_type: String,
     pub(crate) importance_score: u8,
     pub(crate) notes: String,
+    #[serde(default)]
+    pub(crate) user_edited_at: Option<DateTime<Utc>>,
     pub(crate) status: String,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub(crate) struct LinkMetadata {
     pub(crate) source_url: String,
     pub(crate) final_url: String,
@@ -74,6 +92,20 @@ pub(crate) struct LinkMetadata {
     pub(crate) content_text: String,
     #[serde(default)]
     pub(crate) original_text: String,
+    #[serde(default)]
+    pub(crate) shared_text: String,
+    #[serde(default)]
+    pub(crate) original_content: OriginalContent,
+    #[serde(default)]
+    pub(crate) media: Vec<MediaAsset>,
+    #[serde(default)]
+    pub(crate) source_facts: Vec<SourceFact>,
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    #[serde(default)]
+    pub(crate) published_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) extraction: ExtractionState,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

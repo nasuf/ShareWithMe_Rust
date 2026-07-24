@@ -1,22 +1,22 @@
-use regex::Regex;
+use chrono::Utc;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use url::Url;
 
 use crate::{
+    content::{ExtractionState, MediaAsset, OriginalContent, SourceFact, snapshot_fingerprint},
     models::LinkMetadata,
+    platforms::{profile_for, source_identity},
     render::{RenderedPage, render_extract},
 };
 
+use super::adapters::{enrich_from_html, enrich_remote, merge_xiaohongshu_metadata};
 use super::classify::{
     clean_original_text, clean_text, first_meaningful_line, first_non_empty,
     is_blocked_without_content, is_url_only_text, plain_text_preview, platform_for_url,
-    truncate_chars,
 };
-use super::metadata_json::{
-    json_ld_values, json_values_after_markers, json_values_from_script_id, jsonp_value,
-    platform_metadata_from_values, weibo_metadata_from_api_value, weibo_status_id, zhihu_answer_id,
-    zhihu_metadata_from_api_value,
+use super::document::document_from_html;
+use super::platform_metadata::{
+    merge_platform_metadata, merge_platform_state_metadata, platform_api_metadata,
 };
 
 pub(crate) async fn extract_metadata(
@@ -24,18 +24,45 @@ pub(crate) async fn extract_metadata(
     source_url: &str,
     shared_text: Option<&str>,
 ) -> LinkMetadata {
+    extract_metadata_with_video_transcription(http, source_url, shared_text, true).await
+}
+
+pub(crate) async fn extract_metadata_with_video_transcription(
+    http: &Client,
+    source_url: &str,
+    shared_text: Option<&str>,
+    allow_video_transcription: bool,
+) -> LinkMetadata {
+    let fetched_at = Utc::now();
+    let shared_text = shared_text.unwrap_or_default().trim().to_string();
     let mut metadata = LinkMetadata {
         source_url: source_url.to_string(),
         final_url: source_url.to_string(),
         platform: platform_for_url(source_url),
-        title: shared_text
-            .and_then(first_meaningful_line)
-            .unwrap_or_else(|| "未命名链接".to_string()),
-        description: shared_text.unwrap_or_default().trim().to_string(),
+        title: first_meaningful_line(&shared_text).unwrap_or_else(|| "未命名链接".to_string()),
+        description: shared_text.clone(),
         author: None,
         image_url: None,
-        content_text: shared_text.unwrap_or_default().trim().to_string(),
-        original_text: shared_text.unwrap_or_default().trim().to_string(),
+        content_text: shared_text.clone(),
+        original_text: shared_text.clone(),
+        shared_text: shared_text.clone(),
+        original_content: OriginalContent::from_plain_text(shared_text),
+        media: Vec::new(),
+        source_facts: Vec::new(),
+        source_id: None,
+        published_at: None,
+        extraction: ExtractionState {
+            status: "partial".to_string(),
+            adapter: profile_for(&platform_for_url(source_url))
+                .adapter
+                .to_string(),
+            method: "shared_text".to_string(),
+            completeness: 20,
+            fetched_at: Some(fetched_at),
+            refresh_after: None,
+            content_fingerprint: None,
+            last_error: None,
+        },
     };
 
     match http.get(source_url).send().await {
@@ -44,7 +71,10 @@ pub(crate) async fn extract_metadata(
             metadata.platform = platform_for_url(&metadata.final_url);
             let status = response.status();
             match response.text().await {
-                Ok(html) if status.is_success() => merge_html_metadata(&mut metadata, &html),
+                Ok(html) if status.is_success() => {
+                    merge_html_metadata(&mut metadata, &html);
+                    enrich_from_html(&mut metadata, &html);
+                }
                 Ok(body) => {
                     metadata
                         .notes_text_append(format!("页面返回 HTTP {status}; 已保存可见分享文本。"));
@@ -55,18 +85,24 @@ pub(crate) async fn extract_metadata(
                 Err(error) => metadata.notes_text_append(format!("读取页面失败: {error}")),
             }
         }
-        Err(error) => metadata.notes_text_append(format!("请求页面失败: {error}")),
+        Err(error) => {
+            metadata.extraction.last_error = Some(format!("请求页面失败: {error}"));
+            metadata.notes_text_append(format!("请求页面失败: {error}"));
+        }
     }
+    update_source_identity(&mut metadata);
 
+    if let Some(api_metadata) = platform_api_metadata(&metadata, http).await {
+        merge_platform_metadata(&mut metadata, api_metadata);
+        metadata.extraction.method = "platform-api".to_string();
+    }
     if should_try_rendered_extraction(&metadata)
         && let Some(rendered) = render_extract(source_url).await
     {
         merge_rendered_metadata(&mut metadata, rendered);
     }
-
-    if let Some(api_metadata) = platform_api_metadata(&metadata, http).await {
-        merge_platform_metadata(&mut metadata, api_metadata);
-    }
+    enrich_remote(&mut metadata, http, allow_video_transcription).await;
+    sanitize_platform_shell(&mut metadata);
 
     metadata.title = clean_text(&metadata.title);
     metadata.description = clean_text(&metadata.description);
@@ -75,7 +111,219 @@ pub(crate) async fn extract_metadata(
     if metadata.original_text.is_empty() && !metadata.content_text.is_empty() {
         metadata.original_text = metadata.content_text.clone();
     }
+    finalize_metadata(&mut metadata, fetched_at);
     metadata
+}
+
+fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
+    if metadata.extraction.method == "platform-api" || metadata.extraction.method == "yt-dlp" {
+        return;
+    }
+    let text = metadata.original_content.plain_text.as_str();
+    let reason = match metadata.platform.as_str() {
+        "微博"
+            if text.contains("微博热搜")
+                && (text.contains("登录/注册") || text.contains("该微博不存在")) =>
+        {
+            Some("微博只返回了访客/不存在页面，未取得这条微博的正文。")
+        }
+        "抖音"
+            if text.contains("登录后免费畅享高清视频")
+                || (text.contains("扫码登录") && text.contains("验证码登录")) =>
+        {
+            Some("抖音只返回了登录页面，未取得视频说明或字幕。")
+        }
+        "Instagram"
+            if text.contains("Log in")
+                && (text.contains("Sign up") || text.contains("Instagram")) =>
+        {
+            Some("Instagram 只返回了登录页面，未取得帖子正文。")
+        }
+        _ => None,
+    };
+    let Some(reason) = reason else {
+        return;
+    };
+
+    let shared_text = metadata.shared_text.trim();
+    let title_fallback = (metadata.platform == "抖音"
+        && metadata.title != "未命名链接"
+        && !metadata.title.contains("网页验证拦截"))
+    .then(|| {
+        metadata
+            .title
+            .trim_end_matches(" - 抖音")
+            .trim()
+            .to_string()
+    });
+    let fallback = if !shared_text.is_empty() && !is_url_only_text(shared_text) {
+        Some(shared_text.to_string())
+    } else {
+        title_fallback
+    };
+    if let Some(fallback) = fallback.filter(|value| !value.is_empty()) {
+        metadata.content_text = clean_text(&fallback);
+        metadata.original_text = clean_original_text(&fallback);
+        metadata.original_content =
+            OriginalContent::from_plain_text(metadata.original_text.clone());
+        metadata.extraction.method = "metadata-only".to_string();
+    } else {
+        metadata.content_text.clear();
+        metadata.original_text.clear();
+        metadata.original_content = OriginalContent::default();
+        metadata.extraction.method = "blocked-page".to_string();
+    }
+    metadata.extraction.last_error = Some(reason.to_string());
+}
+
+fn finalize_metadata(metadata: &mut LinkMetadata, fetched_at: chrono::DateTime<Utc>) {
+    let identity = preferred_source_identity(metadata);
+    metadata.final_url = identity.canonical_url;
+    metadata.source_id = identity.source_id;
+
+    if metadata.original_content.is_empty() {
+        metadata.original_content = OriginalContent::from_plain_text(&metadata.original_text);
+    }
+    if metadata.original_text.trim().is_empty() {
+        metadata.original_text = metadata.original_content.plain_text.clone();
+    }
+    if let Some(image_url) = metadata.image_url.clone()
+        && !metadata.media.iter().any(|asset| asset.url == image_url)
+    {
+        metadata.media.insert(
+            0,
+            MediaAsset {
+                kind: "image".to_string(),
+                url: image_url,
+                alt: Some(metadata.title.clone()),
+                ..MediaAsset::default()
+            },
+        );
+    }
+
+    let profile = profile_for(&metadata.platform);
+    metadata.extraction.adapter = profile.adapter.to_string();
+    metadata.extraction.fetched_at = Some(fetched_at);
+    metadata.extraction.refresh_after = Some(profile.refresh_after(fetched_at));
+    mark_missing_content_requirement(metadata);
+    let meaningful_text = metadata.original_content.plain_text.trim();
+    metadata.extraction.content_fingerprint = snapshot_fingerprint(
+        &metadata.title,
+        metadata.author.as_deref(),
+        meaningful_text,
+        &metadata.source_facts,
+    );
+    let source_specific = matches!(
+        metadata.extraction.method.as_str(),
+        "embedded-state"
+            | "shared_text"
+            | "platform-api"
+            | "official-api"
+            | "public-preview"
+            | "oembed"
+            | "yt-dlp"
+            | "xhs-initial-state"
+    );
+    let short_snapshot_complete = source_specific
+        && matches!(
+            profile.content_kind,
+            "post" | "video" | "product" | "place" | "book" | "review"
+        )
+        && !meaningful_text.is_empty()
+        && metadata.title != "未命名链接"
+        && (metadata.extraction.method == "shared_text"
+            || metadata.author.is_some()
+            || metadata.image_url.is_some()
+            || metadata.source_facts.len() >= 2);
+
+    if is_blocked_without_content(metadata) {
+        metadata.extraction.status = "blocked".to_string();
+        metadata.extraction.completeness = if metadata.shared_text.chars().count() >= 80 {
+            40
+        } else {
+            15
+        };
+    } else if meaningful_text.chars().count() >= 120
+        || metadata.original_content.blocks.len() >= 2
+        || short_snapshot_complete
+    {
+        metadata.extraction.status = "complete".to_string();
+        metadata.extraction.completeness = 80
+            + u8::from(metadata.author.is_some()) * 5
+            + u8::from(metadata.image_url.is_some()) * 5;
+        if metadata.extraction.method != "blocked-page" {
+            metadata.extraction.last_error = None;
+        }
+    } else {
+        metadata.extraction.status = "partial".to_string();
+        metadata.extraction.completeness = if meaningful_text.is_empty() { 20 } else { 50 };
+    }
+
+    push_source_fact(
+        &mut metadata.source_facts,
+        "content_kind",
+        "内容类型",
+        profile.content_kind,
+    );
+}
+
+fn mark_missing_content_requirement(metadata: &mut LinkMetadata) {
+    if !metadata.original_content.plain_text.trim().is_empty() {
+        return;
+    }
+    let requirement = match metadata.platform.as_str() {
+        "淘宝" | "天猫" => {
+            Some("请保留 App 分享面板中的商品标题/规格文字；仅凭网页 URL 常会触发淘宝登录或风控。")
+        }
+        "百度地图" => Some(
+            "当前链接只公开了地点名称；配置 BAIDU_MAPS_AK 后可补全地址、坐标、电话和营业信息。",
+        ),
+        "Instagram" => Some("该帖子可能是私密、已删除或受地区限制，公开页面未返回 caption。"),
+        _ => None,
+    };
+    let Some(requirement) = requirement else {
+        return;
+    };
+    if metadata.extraction.last_error.is_none() {
+        metadata.extraction.last_error = Some(requirement.to_string());
+    }
+    if metadata.extraction.method == "html" {
+        metadata.extraction.method = "metadata-only".to_string();
+    }
+    push_source_fact(
+        &mut metadata.source_facts,
+        "completion_requirement",
+        "补全方式",
+        requirement,
+    );
+}
+
+fn update_source_identity(metadata: &mut LinkMetadata) {
+    metadata.source_id = preferred_source_identity(metadata).source_id;
+}
+
+fn preferred_source_identity(metadata: &LinkMetadata) -> crate::platforms::SourceIdentity {
+    let final_identity = source_identity(&metadata.final_url, &metadata.platform);
+    if final_identity.source_id.is_some() {
+        return final_identity;
+    }
+    let source_identity = source_identity(&metadata.source_url, &metadata.platform);
+    if source_identity.source_id.is_some() {
+        source_identity
+    } else {
+        final_identity
+    }
+}
+
+fn push_source_fact(facts: &mut Vec<SourceFact>, key: &str, label: &str, value: &str) {
+    if value.trim().is_empty() || facts.iter().any(|fact| fact.key == key) {
+        return;
+    }
+    facts.push(SourceFact {
+        key: key.to_string(),
+        label: label.to_string(),
+        value: value.to_string(),
+    });
 }
 
 trait MetadataNotes {
@@ -94,27 +342,31 @@ impl MetadataNotes for LinkMetadata {
 
 pub(super) fn merge_html_metadata(metadata: &mut LinkMetadata, html: &str) {
     if merge_xiaohongshu_metadata(metadata, html) {
+        metadata.extraction.method = "embedded-state".to_string();
         return;
     }
     if merge_platform_state_metadata(metadata, html) {
+        metadata.extraction.method = "embedded-state".to_string();
         return;
     }
 
-    if let Some(reason) = access_block_reason(html) {
+    if let Some(reason) = access_block_reason(html, &metadata.platform) {
         if metadata.title.trim().is_empty() || metadata.title == "未命名链接" {
             metadata.title = format!("{}链接（网页验证拦截）", metadata.platform);
         }
         if metadata.description.trim().is_empty() || is_url_only_text(&metadata.description) {
-            metadata.description = reason.to_string();
+            metadata.description = reason.clone();
         } else {
-            metadata.notes_text_append(reason.to_string());
+            metadata.notes_text_append(reason.clone());
         }
         if metadata.content_text.trim().is_empty() || is_url_only_text(&metadata.content_text) {
-            metadata.content_text = reason.to_string();
+            metadata.content_text = reason.clone();
         }
         if metadata.original_text.trim().is_empty() || is_url_only_text(&metadata.original_text) {
-            metadata.original_text = reason.to_string();
+            metadata.original_text = reason.clone();
         }
+        metadata.extraction.method = "blocked-page".to_string();
+        metadata.extraction.last_error = Some(reason);
         return;
     }
 
@@ -143,345 +395,28 @@ pub(super) fn merge_html_metadata(metadata: &mut LinkMetadata, html: &str) {
         meta_content(&document, "meta[name='twitter:image']"),
     ]);
 
-    let extracted_text = extract_visible_text(&document);
-    if !extracted_text.is_empty() {
-        metadata.content_text = extracted_text;
-        metadata.original_text = extract_formatted_visible_text(&document);
-    }
-}
-
-fn merge_xiaohongshu_metadata(metadata: &mut LinkMetadata, html: &str) -> bool {
-    if metadata.platform != "小红书" && !metadata.final_url.contains("xiaohongshu.com") {
-        return false;
-    }
-
-    if html.contains("当前笔记暂时无法浏览") || html.contains("你访问的页面不见了")
+    let (original_content, media) = document_from_html(&document, &metadata.final_url);
+    let candidate_chars = original_content.plain_text.chars().count();
+    let shared_chars = metadata.shared_text.chars().count();
+    let shared_is_meaningful =
+        !metadata.shared_text.trim().is_empty() && !is_url_only_text(&metadata.shared_text);
+    if candidate_chars > 0
+        && (!shared_is_meaningful || candidate_chars >= shared_chars.saturating_mul(2).max(200))
     {
-        let reason = "小红书返回了笔记不可浏览页面，后端无法抓取该笔记正文。请换一个可公开访问的分享链接，或从原 App 分享带标题/正文的文本。";
-        if metadata.description.trim().is_empty() || is_url_only_text(&metadata.description) {
-            metadata.description = reason.to_string();
-        } else {
-            metadata.notes_text_append(reason.to_string());
+        metadata.content_text = clean_text(&original_content.plain_text);
+        metadata.original_text = original_content.plain_text.clone();
+        metadata.original_content = original_content;
+        metadata.extraction.method = "html".to_string();
+    }
+    for asset in media {
+        if !metadata
+            .media
+            .iter()
+            .any(|existing| existing.url == asset.url)
+        {
+            metadata.media.push(asset);
         }
-        if metadata.content_text.trim().is_empty() || is_url_only_text(&metadata.content_text) {
-            metadata.content_text = reason.to_string();
-        }
-        if metadata.original_text.trim().is_empty() || is_url_only_text(&metadata.original_text) {
-            metadata.original_text = reason.to_string();
-        }
-        return true;
     }
-
-    let Some(section) = xiaohongshu_note_section(html, &metadata.final_url) else {
-        return false;
-    };
-
-    let title =
-        json_string_field(section, "title").or_else(|| json_string_field(section, "displayTitle"));
-    let description = json_string_field(section, "desc");
-    let original_description = json_raw_string_field(section, "desc");
-    let author =
-        json_string_field(section, "nickname").or_else(|| json_string_field(section, "nickName"));
-    let image_url =
-        json_string_field(section, "urlDefault").or_else(|| json_string_field(section, "urlPre"));
-
-    if title.is_none() && description.is_none() {
-        return false;
-    }
-
-    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
-        metadata.title = title;
-    }
-    if let Some(description) = description.filter(|value| !value.trim().is_empty()) {
-        metadata.description = clean_text(&description);
-        metadata.content_text = clean_text(&format!("{}\n\n{}", metadata.title, description));
-        let original = original_description
-            .as_deref()
-            .map(clean_original_text)
-            .unwrap_or_else(|| clean_original_text(&description));
-        metadata.original_text = if original.is_empty() {
-            metadata.content_text.clone()
-        } else {
-            original
-        };
-    }
-    if let Some(author) = author.filter(|value| !value.trim().is_empty()) {
-        metadata.author = Some(author);
-    }
-    if let Some(image_url) = image_url.filter(|value| !value.trim().is_empty()) {
-        metadata.image_url = Some(image_url);
-    }
-    true
-}
-
-#[derive(Debug, Default)]
-pub(super) struct PlatformMetadata {
-    pub(super) title: Option<String>,
-    pub(super) description: Option<String>,
-    pub(super) author: Option<String>,
-    pub(super) image_url: Option<String>,
-    pub(super) original_text: Option<String>,
-}
-
-impl PlatformMetadata {
-    pub(super) fn is_meaningful(&self) -> bool {
-        self.title.is_some()
-            || self.description.is_some()
-            || self.image_url.is_some()
-            || self.original_text.is_some()
-    }
-}
-
-fn merge_platform_state_metadata(metadata: &mut LinkMetadata, html: &str) -> bool {
-    let platform_metadata = match metadata.platform.as_str() {
-        "抖音" => extract_douyin_metadata(html),
-        "哔哩哔哩" => extract_bilibili_metadata(html),
-        "YouTube" => extract_youtube_metadata(html),
-        "知乎" => extract_zhihu_metadata(html),
-        "微博" => extract_weibo_metadata(html),
-        _ => None,
-    };
-
-    let Some(platform_metadata) = platform_metadata.filter(PlatformMetadata::is_meaningful) else {
-        return false;
-    };
-
-    merge_platform_metadata(metadata, platform_metadata);
-    true
-}
-
-fn merge_platform_metadata(metadata: &mut LinkMetadata, platform_metadata: PlatformMetadata) {
-    if let Some(title) = platform_metadata
-        .title
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.title = title;
-    } else if metadata.title == "未命名链接"
-        && let Some(description) = platform_metadata
-            .description
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-    {
-        metadata.title = truncate_chars(description, 80);
-    }
-
-    if let Some(description) = platform_metadata
-        .description
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.description = description.clone();
-        metadata.content_text = clean_text(&format!("{}\n\n{}", metadata.title, description));
-    } else if metadata.content_text.trim().is_empty() && metadata.title != "未命名链接" {
-        metadata.content_text = metadata.title.clone();
-    }
-
-    if let Some(author) = platform_metadata
-        .author
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.author = Some(author);
-    }
-    if let Some(image_url) = platform_metadata
-        .image_url
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.image_url = Some(image_url);
-    }
-    if let Some(original_text) = platform_metadata
-        .original_text
-        .filter(|value| !value.trim().is_empty())
-    {
-        metadata.original_text = clean_original_text(&original_text);
-    } else if metadata.original_text.trim().is_empty() && !metadata.content_text.trim().is_empty() {
-        metadata.original_text = metadata.content_text.clone();
-    }
-}
-
-fn extract_douyin_metadata(html: &str) -> Option<PlatformMetadata> {
-    let mut candidates = json_values_from_script_id(html, "RENDER_DATA");
-    candidates.extend(json_values_after_markers(
-        html,
-        &[
-            "window.__INIT_PROPS__=",
-            "window._ROUTER_DATA=",
-            "window.__data=",
-        ],
-    ));
-    candidates.extend(json_ld_values(html));
-    platform_metadata_from_values(
-        candidates,
-        &["title", "desc", "description"],
-        &["desc", "description", "seoDescription"],
-        &["nickname", "authorName", "name"],
-        &["cover", "poster", "thumbnailUrl", "urlDefault", "url"],
-    )
-}
-
-fn extract_bilibili_metadata(html: &str) -> Option<PlatformMetadata> {
-    let mut candidates =
-        json_values_after_markers(html, &["window.__INITIAL_STATE__=", "window.__playinfo__="]);
-    candidates.extend(json_ld_values(html));
-    platform_metadata_from_values(
-        candidates,
-        &["title", "name"],
-        &["desc", "description"],
-        &["owner", "author", "name"],
-        &["pic", "cover", "thumbnailUrl", "image"],
-    )
-}
-
-fn extract_youtube_metadata(html: &str) -> Option<PlatformMetadata> {
-    let mut candidates = json_ld_values(html);
-    candidates.extend(json_values_after_markers(
-        html,
-        &["var ytInitialPlayerResponse =", "ytInitialPlayerResponse ="],
-    ));
-    platform_metadata_from_values(
-        candidates,
-        &["title", "name", "headline"],
-        &["shortDescription", "description"],
-        &["author", "ownerChannelName", "name"],
-        &["thumbnailUrl", "thumbnail", "image", "url"],
-    )
-}
-
-fn extract_zhihu_metadata(html: &str) -> Option<PlatformMetadata> {
-    let mut candidates = json_values_from_script_id(html, "js-initialData");
-    candidates.extend(json_ld_values(html));
-    platform_metadata_from_values(
-        candidates,
-        &["title", "questionTitle", "headline"],
-        &["excerpt", "description", "content", "text"],
-        &["author", "name", "headline"],
-        &["thumbnail", "image", "avatarUrl", "url"],
-    )
-}
-
-fn extract_weibo_metadata(html: &str) -> Option<PlatformMetadata> {
-    let mut candidates = json_ld_values(html);
-    candidates.extend(json_values_after_markers(
-        html,
-        &[
-            "window.__INITIAL_STATE__=",
-            "$render_data =",
-            "render_data =",
-        ],
-    ));
-    platform_metadata_from_values(
-        candidates,
-        &[
-            "title",
-            "headline",
-            "page_title",
-            "text_raw",
-            "status_title",
-        ],
-        &["text_raw", "articleBody", "description", "text", "content"],
-        &["screen_name", "author", "name"],
-        &["pic", "pics", "thumbnailUrl", "image", "url"],
-    )
-}
-
-async fn platform_api_metadata(metadata: &LinkMetadata, http: &Client) -> Option<PlatformMetadata> {
-    match metadata.platform.as_str() {
-        "知乎" => {
-            let from_source = fetch_zhihu_answer_metadata(http, &metadata.source_url).await;
-            if from_source.is_some() {
-                from_source
-            } else {
-                fetch_zhihu_answer_metadata(http, &metadata.final_url).await
-            }
-        }
-        "微博" => {
-            let from_source = fetch_weibo_status_metadata(http, &metadata.source_url).await;
-            if from_source.is_some() {
-                from_source
-            } else {
-                fetch_weibo_status_metadata(http, &metadata.final_url).await
-            }
-        }
-        _ => None,
-    }
-}
-
-async fn fetch_zhihu_answer_metadata(http: &Client, raw_url: &str) -> Option<PlatformMetadata> {
-    let answer_id = zhihu_answer_id(raw_url)?;
-    let api_url = format!(
-        "https://www.zhihu.com/api/v4/answers/{answer_id}?include=content,excerpt,question,author"
-    );
-    let value = http
-        .get(api_url)
-        .header(
-            "user-agent",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
-        )
-        .header("accept", "application/json")
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
-    zhihu_metadata_from_api_value(&value)
-}
-
-async fn fetch_weibo_status_metadata(http: &Client, raw_url: &str) -> Option<PlatformMetadata> {
-    let status_id = weibo_status_id(raw_url)?;
-    let (sub, subp) = weibo_visitor_tokens(http).await?;
-    let api_url = format!("https://weibo.com/ajax/statuses/show?id={status_id}");
-    let cookie = format!("SUB={sub}; SUBP={subp}");
-    let value = http
-        .get(api_url)
-        .header("user-agent", "Mozilla/5.0")
-        .header("referer", "https://weibo.com/")
-        .header("accept", "application/json")
-        .header("cookie", cookie)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<serde_json::Value>()
-        .await
-        .ok()?;
-    weibo_metadata_from_api_value(&value)
-}
-
-async fn weibo_visitor_tokens(http: &Client) -> Option<(String, String)> {
-    let visitor_url = "https://passport.weibo.com/visitor/genvisitor?cb=gen_callback&fp=%7B%22os%22%3A%221%22%2C%22browser%22%3A%22Chrome%22%2C%22fonts%22%3A%22undefined%22%2C%22screenInfo%22%3A%221920*1080*24%22%2C%22plugins%22%3A%22%22%7D";
-    let visitor_body = http
-        .get(visitor_url)
-        .header("user-agent", "Mozilla/5.0")
-        .send()
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    let visitor = jsonp_value(&visitor_body)?;
-    let tid = visitor
-        .get("data")
-        .and_then(|data| data.get("tid"))
-        .and_then(serde_json::Value::as_str)?;
-    let incarnate_url = format!(
-        "https://passport.weibo.com/visitor/visitor?a=incarnate&t={tid}&w=2&c=095&gc=&cb=cross_domain&from=weibo"
-    );
-    let incarnate_body = http
-        .get(incarnate_url)
-        .header("user-agent", "Mozilla/5.0")
-        .send()
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    let incarnate = jsonp_value(&incarnate_body)?;
-    let data = incarnate.get("data")?;
-    let sub = data.get("sub").and_then(serde_json::Value::as_str)?;
-    let subp = data.get("subp").and_then(serde_json::Value::as_str)?;
-    Some((sub.to_string(), subp.to_string()))
 }
 
 fn meta_content(document: &Html, selector: &str) -> Option<String> {
@@ -504,114 +439,38 @@ fn select_text(document: &Html, selector: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn extract_visible_text(document: &Html) -> String {
-    let mut chunks = Vec::new();
-    for selector in ["article p", "main p", "p", "h1", "h2", "li"] {
-        if let Ok(selector) = Selector::parse(selector) {
-            for node in document.select(&selector).take(80) {
-                let text = clean_text(&node.text().collect::<Vec<_>>().join(" "));
-                if text.chars().count() >= 12 && !chunks.contains(&text) {
-                    chunks.push(text);
-                }
-                if chunks.join("\n").chars().count() > 12_000 {
-                    break;
-                }
-            }
-        }
-        if chunks.join("\n").chars().count() > 1_500 {
-            break;
-        }
-    }
-    chunks.join("\n")
-}
-
-fn extract_formatted_visible_text(document: &Html) -> String {
-    let mut chunks = Vec::new();
-    for selector in ["article p", "main p", "p", "h1", "h2", "li"] {
-        if let Ok(selector) = Selector::parse(selector) {
-            for node in document.select(&selector).take(120) {
-                let text = clean_original_text(&node.text().collect::<Vec<_>>().join(" "));
-                if text.chars().count() >= 12 && !chunks.contains(&text) {
-                    chunks.push(text);
-                }
-                if chunks.join("\n\n").chars().count() > 12_000 {
-                    break;
-                }
-            }
-        }
-        if chunks.join("\n\n").chars().count() > 2_000 {
-            break;
-        }
-    }
-    chunks.join("\n\n")
-}
-
-fn access_block_reason(html: &str) -> Option<&'static str> {
+fn access_block_reason(html: &str, platform: &str) -> Option<String> {
     let lower = html.to_lowercase();
     if lower.contains("byted_acrawler")
         || lower.contains("__ac_signature")
         || lower.contains("__ac_nonce")
     {
-        return Some(
-            "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。建议从原 App 分享带标题的文本，或手动补充标题/摘要后再整理。",
-        );
+        return Some(match platform {
+            "抖音" => "抖音返回了浏览器验证页面，正在尝试视频元数据和字幕兜底。",
+            _ => "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。建议从原 App 分享带标题的文本，或手动补充标题/摘要后再整理。",
+        }
+        .to_string());
     }
     if lower.contains("sina visitor system") || lower.contains("visitor.passport.weibo") {
         return Some(
-            "微博返回了访客验证页面，后端无法从普通网页直接抓取正文，正在尝试平台接口兜底。",
+            "微博返回了访客验证页面，后端无法从普通网页直接抓取正文，正在尝试平台接口兜底。"
+                .to_string(),
         );
     }
     if lower.contains("zh-zse-ck") || lower.contains("zse-ck") {
         return Some(
-            "知乎返回了访问验证页面，后端无法从普通网页直接抓取正文，正在尝试回答接口兜底。",
+            "知乎返回了访问验证页面，后端无法从普通网页直接抓取正文，正在尝试回答接口兜底。"
+                .to_string(),
         );
     }
     if lower.contains("captcha") || lower.contains("访问验证") || lower.contains("安全验证")
     {
         return Some(
-            "目标网页返回了访问验证页面，后端无法直接抓取正文。建议从原 App 分享带标题的文本，或手动补充标题/摘要后再整理。",
+            "目标网页返回了访问验证页面，后端无法直接抓取正文。建议从原 App 分享带标题的文本，或手动补充标题/摘要后再整理。"
+                .to_string(),
         );
     }
     None
-}
-
-fn xiaohongshu_note_section<'a>(html: &'a str, final_url: &str) -> Option<&'a str> {
-    let start = xiaohongshu_note_id(final_url)
-        .and_then(|note_id| html.find(&format!("\"{note_id}\"")))
-        .or_else(|| html.find("\"noteDetailMap\""))
-        .or_else(|| html.find("\"noteCard\""))?;
-    let end = (start + 120_000).min(html.len());
-    html.get(start..end)
-}
-
-fn xiaohongshu_note_id(raw_url: &str) -> Option<String> {
-    let url = Url::parse(raw_url).ok()?;
-    let segments = url.path_segments()?.collect::<Vec<_>>();
-    let note_id = match segments.as_slice() {
-        ["explore", id, ..] => Some(*id),
-        ["discovery", "item", id, ..] => Some(*id),
-        _ => None,
-    }?;
-    if note_id.is_empty() {
-        None
-    } else {
-        Some(note_id.to_string())
-    }
-}
-
-fn json_string_field(section: &str, key: &str) -> Option<String> {
-    json_raw_string_field(section, key)
-        .map(|value| clean_text(&value))
-        .filter(|value| !value.is_empty())
-}
-
-fn json_raw_string_field(section: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}"\s*:\s*"((?:\\.|[^"\\])*)""#, regex::escape(key));
-    let regex = Regex::new(&pattern).ok()?;
-    let raw = regex.captures(section)?.get(1)?.as_str();
-    serde_json::from_str::<String>(&format!("\"{raw}\""))
-        .ok()
-        .filter(|value| !value.is_empty())
 }
 
 pub(super) fn should_try_rendered_extraction(metadata: &LinkMetadata) -> bool {
@@ -661,9 +520,13 @@ pub(super) fn merge_rendered_metadata(metadata: &mut LinkMetadata, rendered: Ren
         && clean_text(&content_text).chars().count() >= metadata.content_text.chars().count()
     {
         metadata.content_text = clean_text(&content_text);
-        metadata.original_text = content_text;
+        metadata.original_text = content_text.clone();
+        metadata.original_content = OriginalContent::from_plain_text(content_text);
     }
-    let _ = rendered.extractor;
+    metadata.extraction.method = rendered
+        .extractor
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "browser-render".to_string());
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {

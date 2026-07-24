@@ -13,6 +13,8 @@ use super::classify::{
     is_blocked_without_content, truncate_chars,
 };
 
+const MAX_AI_CONTENT_CHARS: usize = 24_000;
+
 pub(crate) async fn analyze_with_deepseek_or_fallback(
     state: &AppState,
     metadata: &LinkMetadata,
@@ -25,6 +27,11 @@ pub(crate) async fn analyze_with_deepseek_or_fallback(
         return heuristic_analysis(metadata, "DeepSeek API key 未配置，已使用本地启发式分析。");
     };
 
+    let source_content = if metadata.original_content.plain_text.trim().is_empty() {
+        metadata.content_text.as_str()
+    } else {
+        metadata.original_content.plain_text.as_str()
+    };
     let payload = json!({
         "model": state.config.deepseek_model,
         "thinking": { "type": "disabled" },
@@ -44,7 +51,8 @@ pub(crate) async fn analyze_with_deepseek_or_fallback(
                     "title": metadata.title,
                     "description": metadata.description,
                     "author": metadata.author,
-                    "content_text": truncate_chars(&metadata.content_text, 7000),
+                    "content_text": analysis_excerpt(source_content, MAX_AI_CONTENT_CHARS),
+                    "source_facts": metadata.source_facts,
                 })).unwrap_or_default()
             }
         ]
@@ -236,6 +244,27 @@ fn normalize_analysis(mut analysis: LinkAnalysis) -> LinkAnalysis {
     analysis
 }
 
+fn analysis_excerpt(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+
+    let head_len = max_chars / 2;
+    let middle_len = max_chars / 4;
+    let tail_len = max_chars - head_len - middle_len;
+    let middle_start = chars.len() / 2 - middle_len / 2;
+    let tail_start = chars.len() - tail_len;
+    format!(
+        "{}\n\n[中段节选]\n{}\n\n[末段节选]\n{}",
+        chars[..head_len].iter().collect::<String>(),
+        chars[middle_start..middle_start + middle_len]
+            .iter()
+            .collect::<String>(),
+        chars[tail_start..].iter().collect::<String>()
+    )
+}
+
 pub(crate) fn build_item(
     metadata: LinkMetadata,
     analysis: LinkAnalysis,
@@ -257,6 +286,13 @@ pub(crate) fn build_item(
         cover_checked_at: None,
         content_text: metadata.content_text,
         original_text: metadata.original_text,
+        shared_text: metadata.shared_text,
+        original_content: metadata.original_content,
+        media: metadata.media,
+        source_facts: metadata.source_facts,
+        source_id: metadata.source_id,
+        published_at: metadata.published_at,
+        extraction: metadata.extraction,
         summary: analysis.summary,
         category: analysis.category,
         keywords: analysis.keywords,
@@ -265,8 +301,23 @@ pub(crate) fn build_item(
         content_type: analysis.content_type,
         importance_score: analysis.importance_score,
         notes: analysis.notes,
+        user_edited_at: None,
         status: "active".to_string(),
         created_at: now,
         updated_at: now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::analysis_excerpt;
+
+    #[test]
+    fn long_analysis_excerpt_keeps_beginning_middle_and_end() {
+        let text = format!("START{}MIDDLE{}END", "a".repeat(40), "b".repeat(40));
+        let excerpt = analysis_excerpt(&text, 36);
+        assert!(excerpt.starts_with("START"));
+        assert!(excerpt.contains("[中段节选]"));
+        assert!(excerpt.ends_with("END"));
     }
 }

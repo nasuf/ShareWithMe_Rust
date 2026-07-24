@@ -1,5 +1,5 @@
 use regex::Regex;
-use url::Url;
+use url::{Host, Url};
 
 use crate::{error::ApiError, models::AnalyzeLinkRequest};
 
@@ -14,7 +14,8 @@ pub(crate) fn resolve_request_url(request: &AnalyzeLinkRequest) -> Result<String
             "request must include an http, https, or supported app short URL",
         ));
     };
-    Url::parse(&url).map_err(|_| ApiError::bad_request("invalid URL"))?;
+    let parsed = Url::parse(&url).map_err(|_| ApiError::bad_request("invalid URL"))?;
+    validate_remote_url(&parsed)?;
     Ok(url)
 }
 
@@ -31,9 +32,63 @@ pub(crate) fn resolve_request_urls(request: &AnalyzeLinkRequest) -> Result<Vec<S
         ));
     }
     for url in &urls {
-        Url::parse(url).map_err(|_| ApiError::bad_request("invalid URL"))?;
+        let parsed = Url::parse(url).map_err(|_| ApiError::bad_request("invalid URL"))?;
+        validate_remote_url(&parsed)?;
     }
     Ok(urls)
+}
+
+pub(crate) fn is_safe_remote_url(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    match url.host() {
+        Some(Host::Ipv4(ip)) => is_public_ipv4(ip),
+        Some(Host::Ipv6(ip)) => {
+            if let Some(ipv4) = ip.to_ipv4() {
+                return is_public_ipv4(ipv4);
+            }
+            let first = ip.segments()[0];
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80)
+        }
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            !(host == "localhost"
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+                || host.ends_with(".internal"))
+        }
+        None => false,
+    }
+}
+
+fn validate_remote_url(url: &Url) -> Result<(), ApiError> {
+    if is_safe_remote_url(url) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "URL must use http/https and point to a public network host",
+        ))
+    }
+}
+
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    if cfg!(test) && ip.is_loopback() {
+        return true;
+    }
+    let octets = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || octets[0] == 0
+        || octets[0] >= 224
+        || (octets[0] == 100 && (64..=127).contains(&octets[1])))
 }
 
 pub(crate) fn extract_first_url(input: &str) -> Option<String> {
@@ -94,28 +149,34 @@ fn is_supported_bare_url_host(host: &str) -> bool {
         "kuaishou.com",
         "gifshow.com",
         "t.cn",
+        "t.co",
         "weibo.com",
         "weibo.cn",
         "mp.weixin.qq.com",
         "toutiao.com",
         "snssdk.com",
         "m.tb.cn",
+        "e.tb.cn",
         "tb.cn",
         "taobao.com",
         "tmall.com",
         "u.jd.com",
+        "3.cn",
         "jd.com",
         "yangkeduo.com",
         "pinduoduo.com",
         "smzdm.com",
         "zhihu.com",
         "zhuanlan.zhihu.com",
+        "twitter.com",
+        "x.com",
         "sspai.com",
         "juejin.cn",
         "csdn.net",
         "36kr.com",
         "ithome.com",
         "douban.com",
+        "weread.qq.com",
         "pan.baidu.com",
         "music.163.com",
         "y.qq.com",
@@ -128,6 +189,10 @@ fn is_supported_bare_url_host(host: &str) -> bool {
         "larksuite.com",
         "amap.com",
         "gaode.com",
+        "surl.amap.com",
+        "uri.amap.com",
+        "map.baidu.com",
+        "j.map.baidu.com",
         "maps.apple.com",
         "dianping.com",
         "meituan.com",
@@ -139,6 +204,8 @@ fn is_supported_bare_url_host(host: &str) -> bool {
         "youtu.be",
         "tiktok.com",
         "instagram.com",
+        "instagr.am",
+        "ig.me",
         "facebook.com",
         "fb.watch",
         "reddit.com",

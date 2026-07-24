@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           ssh "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}" "mkdir -p '${APP_DIR}'"
-          rsync -az --delete dist/ "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}:${APP_DIR}/"
+          rsync -az --delete --exclude '.env' --exclude 'media/' dist/ "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}:${APP_DIR}/"
 
       - name: Install service and restart
         env:
@@ -84,23 +84,55 @@ jobs:
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/chat/completions' }}
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-v4-flash' }}
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+          SHARE_WITH_ME_API_TOKEN: ${{ secrets.SHARE_WITH_ME_API_TOKEN }}
+          SHARE_WITH_ME_ASR_URL: ${{ vars.SHARE_WITH_ME_ASR_URL }}
+          SHARE_WITH_ME_ASR_API_KEY: ${{ secrets.SHARE_WITH_ME_ASR_API_KEY }}
+          SHARE_WITH_ME_ASR_MODEL: ${{ vars.SHARE_WITH_ME_ASR_MODEL || 'whisper-1' }}
+          INSTAGRAM_OEMBED_TOKEN: ${{ secrets.INSTAGRAM_OEMBED_TOKEN }}
+          AMAP_WEB_SERVICE_KEY: ${{ secrets.AMAP_WEB_SERVICE_KEY }}
+          BAIDU_MAPS_AK: ${{ secrets.BAIDU_MAPS_AK }}
         run: |
           set -euo pipefail
           ssh "${{ secrets.RACKNERD_USER }}@${{ secrets.RACKNERD_HOST }}" \
             "APP_DIR='${APP_DIR}' SERVICE_NAME='${SERVICE_NAME}' SHARE_WITH_ME_BIND='${SHARE_WITH_ME_BIND}' \
              DEEPSEEK_API_KEY='${DEEPSEEK_API_KEY}' DEEPSEEK_BASE_URL='${DEEPSEEK_BASE_URL}' \
-             DEEPSEEK_MODEL='${DEEPSEEK_MODEL}' SUPABASE_DATABASE_URL='${SUPABASE_DATABASE_URL}' bash -s" <<'REMOTE'
+             DEEPSEEK_MODEL='${DEEPSEEK_MODEL}' SUPABASE_DATABASE_URL='${SUPABASE_DATABASE_URL}' \
+             SHARE_WITH_ME_API_TOKEN='${SHARE_WITH_ME_API_TOKEN}' \
+             SHARE_WITH_ME_ASR_URL='${SHARE_WITH_ME_ASR_URL}' \
+             SHARE_WITH_ME_ASR_API_KEY='${SHARE_WITH_ME_ASR_API_KEY}' \
+             SHARE_WITH_ME_ASR_MODEL='${SHARE_WITH_ME_ASR_MODEL}' \
+             INSTAGRAM_OEMBED_TOKEN='${INSTAGRAM_OEMBED_TOKEN}' \
+             AMAP_WEB_SERVICE_KEY='${AMAP_WEB_SERVICE_KEY}' BAIDU_MAPS_AK='${BAIDU_MAPS_AK}' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd "$APP_DIR"
           chmod +x sharewithme-backend
           npm ci --omit=dev
 
+          YTDLP_VERSION=2026.06.09
+          YTDLP_SHA256=e5d57466682cfa9d61e9cf7c8a4f09b00f4a62af37d3bbdc4bcffdf63615feac
+          if ! command -v yt-dlp >/dev/null 2>&1 || ! yt-dlp --version | grep -qx "$YTDLP_VERSION"; then
+            curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" -o /tmp/yt-dlp
+            echo "$YTDLP_SHA256  /tmp/yt-dlp" | sha256sum -c -
+            install -m 0755 /tmp/yt-dlp /usr/local/bin/yt-dlp
+            rm -f /tmp/yt-dlp
+          fi
+
+          mkdir -p "$APP_DIR/media"
+
           cat > .env <<ENV
           SHARE_WITH_ME_BIND=$SHARE_WITH_ME_BIND
           SHARE_WITH_ME_STORE_BACKEND=supabase
           SHARE_WITH_ME_MEDIA=$APP_DIR/media
           SHARE_WITH_ME_RENDERER=$APP_DIR/tools/render_extract.mjs
+          SHARE_WITH_ME_YTDLP=/usr/local/bin/yt-dlp
+          SHARE_WITH_ME_API_TOKEN=$SHARE_WITH_ME_API_TOKEN
+          SHARE_WITH_ME_ASR_URL=$SHARE_WITH_ME_ASR_URL
+          SHARE_WITH_ME_ASR_API_KEY=$SHARE_WITH_ME_ASR_API_KEY
+          SHARE_WITH_ME_ASR_MODEL=$SHARE_WITH_ME_ASR_MODEL
+          INSTAGRAM_OEMBED_TOKEN=$INSTAGRAM_OEMBED_TOKEN
+          AMAP_WEB_SERVICE_KEY=$AMAP_WEB_SERVICE_KEY
+          BAIDU_MAPS_AK=$BAIDU_MAPS_AK
           DEEPSEEK_BASE_URL=$DEEPSEEK_BASE_URL
           DEEPSEEK_MODEL=$DEEPSEEK_MODEL
           DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY
@@ -134,5 +166,7 @@ jobs:
           systemctl daemon-reload
           systemctl enable "$SERVICE_NAME"
           systemctl restart "$SERVICE_NAME"
+          sleep 2
+          curl --fail --silent --show-error "http://127.0.0.1:${SHARE_WITH_ME_BIND##*:}/health"
           systemctl --no-pager --full status "$SERVICE_NAME"
           REMOTE

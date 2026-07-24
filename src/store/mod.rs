@@ -110,7 +110,9 @@ impl Store {
         if let Some(notes) = request.notes {
             item.notes = notes;
         }
-        item.updated_at = Utc::now();
+        let now = Utc::now();
+        item.user_edited_at = Some(now);
+        item.updated_at = now;
         self.save_item(item.clone()).await?;
         Ok(item)
     }

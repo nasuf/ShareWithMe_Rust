@@ -18,14 +18,27 @@ pub(crate) fn platform_for_url(raw_url: &str) -> String {
         value if value.contains("kuaishou.com") || value.contains("gifshow.com") => "快手",
         value if value.contains("bilibili.com") || value.contains("b23.tv") => "哔哩哔哩",
         value if value.contains("zhihu.com") => "知乎",
-        value if value.contains("weibo.com") || value.contains("weibo.cn") => "微博",
+        value if value.contains("weibo.com") || value.contains("weibo.cn") || value == "t.cn" => {
+            "微博"
+        }
+        value if value.contains("weread.qq.com") => "微信读书",
         value if value.contains("mp.weixin.qq.com") => "微信公众号",
         value if value.contains("weixin.qq.com") || value.contains("qq.com") => "腾讯内容",
+        value if value.contains("map.baidu.com") || value == "j.map.baidu.com" => "百度地图",
         value if value.contains("pan.baidu.com") => "百度网盘",
         value if value.contains("baidu.com") || value.contains("baike.baidu.com") => "百度",
         value if value.contains("youtube.com") || value.contains("youtu.be") => "YouTube",
-        value if value.contains("twitter.com") || value == "x.com" => "X",
-        value if value.contains("instagram.com") => "Instagram",
+        value
+            if value.contains("twitter.com")
+                || value == "x.com"
+                || value.ends_with(".x.com")
+                || value == "t.co" =>
+        {
+            "X"
+        }
+        value if value.contains("instagram.com") || matches!(value, "instagr.am" | "ig.me") => {
+            "Instagram"
+        }
         value if value.contains("tiktok.com") => "TikTok",
         value if value.contains("facebook.com") || value.contains("fb.watch") => "Facebook",
         value if value.contains("reddit.com") => "Reddit",
@@ -50,15 +63,13 @@ pub(crate) fn platform_for_url(raw_url: &str) -> String {
         }
         value if value.contains("dianping.com") => "大众点评",
         value if value.contains("meituan.com") => "美团",
+        value if value.contains("tmall.com") => "天猫",
         value
-            if value.contains("taobao.com")
-                || value.contains("tmall.com")
-                || value == "m.tb.cn"
-                || value == "tb.cn" =>
+            if value.contains("taobao.com") || matches!(value, "m.tb.cn" | "e.tb.cn" | "tb.cn") =>
         {
-            "淘宝/天猫"
+            "淘宝"
         }
-        value if value.contains("jd.com") => "京东",
+        value if value.contains("jd.com") || matches!(value, "u.jd.com" | "3.cn") => "京东",
         value if value.contains("yangkeduo.com") || value.contains("pinduoduo.com") => "拼多多",
         value if value.contains("smzdm.com") => "什么值得买",
         value if value.contains("amazon.") => "Amazon",
@@ -225,7 +236,7 @@ pub(crate) fn infer_category(text: &str, platform: &str) -> String {
         "知乎" => "知识问答".to_string(),
         "微博" => "社交动态".to_string(),
         "GitHub" | "GitLab" | "掘金" | "CSDN" | "少数派" | "IT之家" => "技术".to_string(),
-        "淘宝/天猫" | "京东" | "拼多多" | "Amazon" | "什么值得买" => {
+        "淘宝" | "天猫" | "京东" | "拼多多" | "Amazon" | "什么值得买" => {
             "购物".to_string()
         }
         "高德地图" | "Apple Maps" | "Google Maps" | "大众点评" | "美团" => {
@@ -356,10 +367,17 @@ pub(super) fn fallback_summary(metadata: &LinkMetadata) -> String {
 }
 
 pub(super) fn first_meaningful_line(text: &str) -> Option<String> {
+    let url_regex = Regex::new(r#"https?://\S+|www\.\S+"#).ok();
     text.lines()
-        .map(str::trim)
-        .find(|line| line.chars().count() >= 4 && !line.starts_with("http"))
-        .map(|line| truncate_chars(line, 120))
+        .map(|line| {
+            url_regex
+                .as_ref()
+                .map(|regex| regex.replace_all(line, " ").to_string())
+                .unwrap_or_else(|| line.to_string())
+        })
+        .map(|line| clean_text(&line))
+        .find(|line| line.chars().count() >= 4)
+        .map(|line| truncate_chars(&line, 120))
 }
 
 pub(super) fn is_url_only_text(text: &str) -> bool {
@@ -380,7 +398,8 @@ pub(super) fn is_url_only_text(text: &str) -> bool {
 }
 
 pub(super) fn is_blocked_without_content(metadata: &LinkMetadata) -> bool {
-    metadata.title.contains("网页验证拦截")
+    metadata.extraction.method == "blocked-page"
+        || metadata.title.contains("网页验证拦截")
         || metadata.content_text.contains("无法从公开网页直接抓取正文")
         || metadata.content_text.contains("无法直接抓取正文")
 }

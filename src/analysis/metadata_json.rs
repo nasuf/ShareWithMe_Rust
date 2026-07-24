@@ -5,7 +5,7 @@ use super::{
         clean_original_text, clean_text, first_meaningful_line, html_to_formatted_text,
         plain_text_preview, truncate_chars,
     },
-    metadata::PlatformMetadata,
+    platform_metadata::PlatformMetadata,
 };
 
 pub(super) fn zhihu_answer_id(raw_url: &str) -> Option<String> {

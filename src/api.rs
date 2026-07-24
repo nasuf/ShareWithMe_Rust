@@ -1,46 +1,50 @@
-use anyhow::Context;
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
-use chrono::{Duration, Utc};
-use image::{ColorType, codecs::jpeg::JpegEncoder, imageops::FilterType};
+use chrono::Utc;
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use url::Url;
 
 use crate::{
     analysis::{
         analyze_with_deepseek_or_fallback, build_item, check_deepseek, extract_metadata,
-        resolve_request_url, resolve_request_urls,
+        extract_metadata_with_video_transcription, is_safe_remote_url, resolve_request_url,
+        resolve_request_urls,
     },
+    config::AppConfig,
+    content::snapshot_fingerprint,
     digest::{collection_digest, count_by},
     error::ApiError,
     models::{
         AnalyzeLinkRequest, AnalyzerCheckResponse, CollectionDigest, CollectionStats,
-        HealthResponse, JsonExport, JsonImportRequest, JsonImportResponse, LinkItem, LinkMetadata,
+        HealthResponse, JsonImportRequest, JsonImportResponse, LinkItem, LinkMetadata,
         ListItemsQuery, UpdateItemRequest, UpdateStatusRequest,
     },
     state::AppState,
     store::{
-        all_items, delete_item_by_id, find_item, import_items, save_item, update_item_cover,
-        update_item_metadata, update_item_status,
+        all_items, delete_item_by_id, find_item, import_items, save_item, update_item_metadata,
+        update_item_status,
     },
 };
 
-const COVER_REFRESH_COOLDOWN: Duration = Duration::hours(6);
+mod collection;
+mod media;
+
+pub(crate) use collection::{build_json_export, build_markdown_export, matches_filter, sort_items};
+use media::{is_local_media_url, media_file, refresh_cover, schedule_media_cache};
 
 #[derive(Default, serde::Deserialize)]
-struct RefreshCoverQuery {
+struct RefreshQuery {
     force: Option<bool>,
 }
 
 pub(crate) fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/api/items", get(list_items))
         .route(
             "/api/items/{id}",
@@ -48,16 +52,25 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/items/{id}/status", patch(update_status))
         .route("/api/items/{id}/reanalyze", post(reanalyze_item))
+        .route("/api/items/{id}/refresh", post(refresh_item_content))
         .route("/api/items/{id}/cover/refresh", post(refresh_cover))
         .route("/api/links/analyze", post(analyze_link))
         .route("/api/links/analyze-many", post(analyze_links))
-        .route("/media/{file}", get(media_file))
         .route("/api/stats", get(stats))
         .route("/api/digest", get(digest))
         .route("/api/export/markdown", get(export_markdown))
         .route("/api/export/json", get(export_json))
         .route("/api/import/json", post(import_json))
         .route("/api/analyzer/check", post(check_analyzer))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.config),
+            require_api_token,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/media/{file}", get(media_file))
+        .merge(protected)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -65,6 +78,41 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 .allow_headers(Any),
         )
         .with_state(state)
+}
+
+async fn require_api_token(
+    State(config): State<Arc<AppConfig>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let Some(expected) = config.api_token.as_deref() else {
+        return Ok(next.run(request).await);
+    };
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    if !supplied.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes())) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -116,6 +164,7 @@ async fn analyze_one_url(
     save_item(&state.store, item.clone())
         .await
         .map_err(ApiError::internal)?;
+    schedule_media_cache(state.clone(), item.id.clone());
     Ok(item)
 }
 
@@ -146,6 +195,13 @@ async fn reanalyze_item(
         } else {
             current.original_text.clone()
         },
+        shared_text: current.shared_text.clone(),
+        original_content: current.original_content.clone(),
+        media: current.media.clone(),
+        source_facts: current.source_facts.clone(),
+        source_id: current.source_id.clone(),
+        published_at: current.published_at,
+        extraction: current.extraction.clone(),
     };
     let analysis = analyze_with_deepseek_or_fallback(&state, &metadata).await;
     let mut updated = build_item(metadata, analysis, current.source_app.clone());
@@ -155,186 +211,170 @@ async fn reanalyze_item(
     save_item(&state.store, updated.clone())
         .await
         .map_err(ApiError::internal)?;
+    schedule_media_cache(state, updated.id.clone());
     Ok(Json(updated))
 }
 
-async fn refresh_cover(
+async fn refresh_item_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<RefreshCoverQuery>,
+    Query(query): Query<RefreshQuery>,
 ) -> Result<Json<LinkItem>, ApiError> {
     let current = find_item(&state.store, &id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("item not found"))?;
     let now = Utc::now();
-    let force = query.force.unwrap_or(false);
-
-    if !force
-        && current.cover_checked_at.is_some_and(|checked_at| {
-            now.signed_duration_since(checked_at) < COVER_REFRESH_COOLDOWN
-        })
-    {
+    if !query.force.unwrap_or(false) && !current.extraction.is_stale_at(now) {
         return Ok(Json(current));
     }
 
-    let candidates = cover_candidates(&state, &current).await;
-
-    for remote_url in candidates {
-        if let Ok(local_url) = cache_cover_image(&state, &current.id, &remote_url).await {
-            let updated = update_item_cover(
-                &state.store,
-                &current.id,
-                Some(local_url),
-                Some(remote_url),
-                Some(now),
-                now,
-            )
-            .await
-            .map_err(ApiError::internal)?;
-            return Ok(Json(updated));
-        }
+    let shared_text =
+        (!current.shared_text.trim().is_empty()).then_some(current.shared_text.as_str());
+    let existing_transcript = current
+        .source_facts
+        .iter()
+        .find(|fact| fact.key == "transcript_source")
+        .cloned();
+    let mut metadata = extract_metadata_with_video_transcription(
+        &state.http,
+        &current.source_url,
+        shared_text,
+        existing_transcript.is_none(),
+    )
+    .await;
+    if existing_transcript.is_some() {
+        preserve_existing_transcript(&current, &mut metadata);
     }
+    let current_has_snapshot =
+        !current.original_content.is_empty() || current.original_text.trim().chars().count() >= 40;
+    let existing_completeness = if current.extraction.status == "legacy" && current_has_snapshot {
+        70
+    } else {
+        current.extraction.completeness
+    };
+    let fresh_is_better =
+        metadata.extraction.completeness >= existing_completeness || !current_has_snapshot;
 
-    let updated = update_item_cover(&state.store, &current.id, None, None, None, now)
+    let updated = if fresh_is_better {
+        let content_changed =
+            metadata.extraction.content_fingerprint != current.extraction.content_fingerprint;
+        let analysis = if content_changed || current.extraction.status == "legacy" {
+            analyze_with_deepseek_or_fallback(&state, &metadata).await
+        } else {
+            analysis_from_item(&current)
+        };
+        merge_refreshed_item(current, build_item(metadata, analysis, None))
+    } else {
+        preserve_last_good_snapshot(current, &metadata)
+    };
+
+    save_item(&state.store, updated.clone())
         .await
         .map_err(ApiError::internal)?;
+    schedule_media_cache(state, updated.id.clone());
     Ok(Json(updated))
 }
 
-async fn media_file(
-    State(state): State<AppState>,
-    Path(file): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    if file.contains('/') || file.contains('\\') || file.starts_with('.') {
-        return Err(ApiError::not_found("media not found"));
-    }
-    let path = state.config.media_path.join(file);
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|_| ApiError::not_found("media not found"))?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-        ],
-        bytes,
-    ))
-}
-
-async fn cover_candidates(state: &AppState, current: &LinkItem) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let mut metadata_urls = Vec::new();
-
-    for source in [&current.source_url, &current.final_url] {
-        let trimmed = source.trim();
-        if trimmed.is_empty() || metadata_urls.iter().any(|url| url == trimmed) {
-            continue;
-        }
-        metadata_urls.push(trimmed.to_string());
-    }
-
-    for source in metadata_urls {
-        let metadata = extract_metadata(&state.http, &source, None).await;
-        push_cover_candidate(&mut candidates, metadata.image_url.as_deref());
-    }
-
-    for value in [
-        current.remote_image_url.as_deref(),
-        current
-            .image_url
-            .as_deref()
-            .filter(|url| !is_local_media_url(url)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        push_cover_candidate(&mut candidates, Some(value));
-    }
-    candidates
-}
-
-fn push_cover_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+fn preserve_existing_transcript(current: &LinkItem, metadata: &mut LinkMetadata) {
+    let Some(transcript_source) = current
+        .source_facts
+        .iter()
+        .find(|fact| fact.key == "transcript_source")
+        .cloned()
+    else {
         return;
     };
-    if !candidates.iter().any(|candidate| candidate == value) {
-        candidates.push(value.to_string());
+    if metadata
+        .source_facts
+        .iter()
+        .any(|fact| fact.key == "transcript_source")
+    {
+        return;
+    }
+
+    metadata.original_text = current.original_text.clone();
+    metadata.content_text = current.content_text.clone();
+    metadata.original_content = current.original_content.clone();
+    metadata.source_facts.push(transcript_source);
+    metadata.extraction.content_fingerprint = snapshot_fingerprint(
+        &metadata.title,
+        metadata.author.as_deref(),
+        &metadata.original_content.plain_text,
+        &metadata.source_facts,
+    );
+    metadata.extraction.completeness = metadata
+        .extraction
+        .completeness
+        .max(current.extraction.completeness);
+}
+
+fn analysis_from_item(item: &LinkItem) -> crate::models::LinkAnalysis {
+    crate::models::LinkAnalysis {
+        summary: item.summary.clone(),
+        category: item.category.clone(),
+        keywords: item.keywords.clone(),
+        entities: item.entities.clone(),
+        sentiment: item.sentiment.clone(),
+        content_type: item.content_type.clone(),
+        importance_score: item.importance_score,
+        notes: item.notes.clone(),
     }
 }
 
-async fn cache_cover_image(
-    state: &AppState,
-    item_id: &str,
-    remote_url: &str,
-) -> anyhow::Result<String> {
-    Url::parse(remote_url).context("parse cover URL")?;
-    let response = state
-        .http
-        .get(remote_url)
-        .header(header::REFERER, referer_for_cover(remote_url))
-        .send()
-        .await
-        .context("download cover")?;
-    if !response.status().is_success() {
-        anyhow::bail!("download cover returned HTTP {}", response.status());
+fn merge_refreshed_item(current: LinkItem, mut fresh: LinkItem) -> LinkItem {
+    for asset in &mut fresh.media {
+        if asset.cached_url.is_none()
+            && let Some(cached_url) = current
+                .media
+                .iter()
+                .find(|current_asset| current_asset.url == asset.url)
+                .and_then(|current_asset| current_asset.cached_url.clone())
+        {
+            asset.cached_url = Some(cached_url);
+        }
     }
-    let bytes = response.bytes().await.context("read cover bytes")?;
-    if bytes.len() > 12 * 1024 * 1024 {
-        anyhow::bail!("cover image too large");
+    fresh.id = current.id;
+    fresh.source_app = current.source_app;
+    fresh.created_at = current.created_at;
+    fresh.status = current.status;
+    fresh.user_edited_at = current.user_edited_at;
+    if current.user_edited_at.is_some() {
+        fresh.category = current.category;
+        fresh.keywords = current.keywords;
+        fresh.notes = current.notes;
     }
-
-    let jpeg = compress_cover_jpeg(&bytes)?;
-    tokio::fs::create_dir_all(&state.config.media_path)
-        .await
-        .with_context(|| {
-            format!(
-                "create media directory {}",
-                state.config.media_path.display()
-            )
-        })?;
-    let file_name = format!("cover-{}.jpg", safe_file_id(item_id));
-    let path = state.config.media_path.join(&file_name);
-    tokio::fs::write(&path, jpeg)
-        .await
-        .with_context(|| format!("write cover {}", path.display()))?;
-    Ok(format!("/media/{file_name}"))
-}
-
-fn compress_cover_jpeg(bytes: &Bytes) -> anyhow::Result<Vec<u8>> {
-    let image = image::load_from_memory(bytes).context("decode cover image")?;
-    let resized = image.resize(900, 900, FilterType::Lanczos3).to_rgb8();
-    let (width, height) = resized.dimensions();
-    let mut output = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut output, 82);
-    encoder
-        .encode(&resized, width, height, ColorType::Rgb8.into())
-        .context("encode cover jpeg")?;
-    Ok(output)
-}
-
-fn referer_for_cover(remote_url: &str) -> &'static str {
-    let host = Url::parse(remote_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_default();
-    if host.contains("xhscdn.com") || host.contains("xiaohongshu.com") {
-        "https://www.xiaohongshu.com/"
-    } else if host.contains("toutiao") || host.contains("byteimg") {
-        "https://www.toutiao.com/"
-    } else {
-        "https://www.google.com/"
+    if current.image_url.as_deref().is_some_and(is_local_media_url) {
+        fresh.remote_image_url = fresh.image_url.clone().or(current.remote_image_url);
+        fresh.image_url = current.image_url;
+        fresh.cover_cached_at = current.cover_cached_at;
+        fresh.cover_checked_at = current.cover_checked_at;
     }
+    fresh.updated_at = Utc::now();
+    fresh
 }
 
-fn is_local_media_url(url: &str) -> bool {
-    url.starts_with("/media/")
-}
-
-fn safe_file_id(id: &str) -> String {
-    id.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-        .collect::<String>()
+fn preserve_last_good_snapshot(mut current: LinkItem, attempted: &LinkMetadata) -> LinkItem {
+    if current.original_content.is_empty() {
+        current.original_content = crate::content::OriginalContent::from_plain_text(
+            if current.original_text.trim().is_empty() {
+                &current.content_text
+            } else {
+                &current.original_text
+            },
+        );
+    }
+    current.extraction.status = "stale".to_string();
+    current.extraction.fetched_at = attempted.extraction.fetched_at;
+    current.extraction.refresh_after = attempted.extraction.refresh_after;
+    current.extraction.last_error = attempted.extraction.last_error.clone().or_else(|| {
+        Some(format!(
+            "{} 本次刷新只获得不完整内容，已保留上一次完整快照。",
+            attempted.platform
+        ))
+    });
+    current.updated_at = Utc::now();
+    current
 }
 
 async fn list_items(
@@ -527,6 +567,15 @@ fn validate_json_import(request: JsonImportRequest) -> Result<JsonImportRequest,
         if item.source_url.trim().is_empty() || item.final_url.trim().is_empty() {
             return Err(ApiError::bad_request("item URLs cannot be empty"));
         }
+        for raw_url in [&item.source_url, &item.final_url] {
+            let url = url::Url::parse(raw_url)
+                .map_err(|_| ApiError::bad_request("item URLs must be valid"))?;
+            if !is_safe_remote_url(&url) {
+                return Err(ApiError::bad_request(
+                    "item URLs must point to public network hosts",
+                ));
+            }
+        }
         if item.title.trim().is_empty() {
             return Err(ApiError::bad_request("item title cannot be empty"));
         }
@@ -539,152 +588,5 @@ fn validate_json_import(request: JsonImportRequest) -> Result<JsonImportRequest,
     Ok(request)
 }
 
-pub(crate) fn matches_filter(item: &LinkItem, query: &ListItemsQuery) -> bool {
-    if let Some(status) = &query.status
-        && !status.is_empty()
-        && item.status != *status
-    {
-        return false;
-    }
-    if let Some(category) = &query.category
-        && !category.is_empty()
-        && item.category != *category
-    {
-        return false;
-    }
-    if let Some(platform) = &query.platform
-        && !platform.is_empty()
-        && item.platform != *platform
-    {
-        return false;
-    }
-    if let Some(search) = &query.query {
-        let needle = search.trim().to_lowercase();
-        if !needle.is_empty() {
-            let haystack = format!(
-                "{} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                item.title,
-                item.description,
-                item.summary,
-                item.category,
-                item.platform,
-                item.source_url,
-                item.final_url,
-                item.source_app.as_deref().unwrap_or_default(),
-                item.author.as_deref().unwrap_or_default(),
-                item.content_type,
-                item.notes,
-                item.keywords.join(" "),
-                item.entities.join(" "),
-                item.content_text
-            )
-            .to_lowercase();
-            return haystack.contains(&needle);
-        }
-    }
-    true
-}
-
-pub(crate) fn build_markdown_export(items: &[LinkItem]) -> String {
-    let digest = collection_digest(items);
-    let mut output = String::new();
-    output.push_str("# ShareWithMe Export\n\n");
-    output.push_str(&format!(
-        "- Generated: {}\n- Total active items: {}\n- Total stored items: {}\n\n",
-        Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-        digest.total,
-        items.len()
-    ));
-    output.push_str("## Collection Summary\n\n");
-    output.push_str(&format!("{}\n\n", digest.focus_summary));
-    if !digest.category_summaries.is_empty() {
-        output.push_str("### Categories\n\n");
-        for bucket in &digest.category_summaries {
-            output.push_str(&format!("- {}: {}\n", bucket.label, bucket.count));
-        }
-        output.push('\n');
-    }
-    output.push_str("## Items\n\n");
-    for item in items {
-        output.push_str(&format!("### {}\n\n", sanitize_markdown_line(&item.title)));
-        output.push_str(&format!(
-            "- Platform: {}\n- Category: {}\n- Type: {}\n- Status: {}\n- Importance: {}\n- Created: {}\n- URL: {}\n",
-            sanitize_markdown_line(&item.platform),
-            sanitize_markdown_line(&item.category),
-            sanitize_markdown_line(&item.content_type),
-            sanitize_markdown_line(&item.status),
-            item.importance_score,
-            item.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            item.final_url
-        ));
-        if !item.keywords.is_empty() {
-            output.push_str(&format!(
-                "- Keywords: {}\n",
-                item.keywords
-                    .iter()
-                    .map(|value| sanitize_markdown_line(value))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        output.push('\n');
-        if !item.summary.trim().is_empty() {
-            output.push_str(&format!("{}\n\n", sanitize_markdown_line(&item.summary)));
-        }
-        let original_text = if item.original_text.trim().is_empty() {
-            item.content_text.trim()
-        } else {
-            item.original_text.trim()
-        };
-        if !original_text.is_empty() {
-            output.push_str("#### 原文\n\n");
-            output.push_str(original_text);
-            output.push_str("\n\n");
-        }
-        if !item.notes.trim().is_empty() {
-            output.push_str(&format!(
-                "> Notes: {}\n\n",
-                sanitize_markdown_line(&item.notes)
-            ));
-        }
-    }
-    output
-}
-
-pub(crate) fn build_json_export(items: Vec<LinkItem>) -> JsonExport {
-    let digest = collection_digest(&items);
-    JsonExport {
-        schema_version: 1,
-        generated_at: Utc::now(),
-        item_count: items.len(),
-        digest,
-        items,
-    }
-}
-
-fn sanitize_markdown_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-pub(crate) fn sort_items(items: &mut [LinkItem], sort: Option<&str>) {
-    match sort.unwrap_or("newest") {
-        "oldest" => items.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.title.cmp(&b.title))
-        }),
-        "importance" => items.sort_by(|a, b| {
-            b.importance_score
-                .cmp(&a.importance_score)
-                .then_with(|| b.created_at.cmp(&a.created_at))
-                .then_with(|| a.title.cmp(&b.title))
-        }),
-        _ => items.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| a.title.cmp(&b.title))
-        }),
-    }
-}
 #[cfg(test)]
 mod api_tests;

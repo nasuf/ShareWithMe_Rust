@@ -9,6 +9,17 @@ The backend stores production data in Supabase Postgres and runs on RackNerd thr
 - `RACKNERD_SSH_KEY`: private SSH key for that user
 - `SUPABASE_DATABASE_URL`: Supabase session-pooler Postgres URL for `nasuf / ShareWithMe`
 - `DEEPSEEK_API_KEY`: DeepSeek API key
+- `SHARE_WITH_ME_API_TOKEN`: random bearer token shared only with the Flutter build
+
+Build or run Flutter with the matching token:
+
+```text
+--dart-define=SHARE_WITH_ME_API_TOKEN=<same-random-token>
+```
+
+Optional enrichment secrets are `INSTAGRAM_OEMBED_TOKEN`,
+`AMAP_WEB_SERVICE_KEY`, `BAIDU_MAPS_AK`, and
+`SHARE_WITH_ME_ASR_API_KEY`.
 
 ## Optional GitHub Variables
 
@@ -17,6 +28,8 @@ The backend stores production data in Supabase Postgres and runs on RackNerd thr
 - `SHARE_WITH_ME_BIND`: default `0.0.0.0:8080`
 - `DEEPSEEK_BASE_URL`: default `https://api.deepseek.com/chat/completions`
 - `DEEPSEEK_MODEL`: default `deepseek-v4-flash`
+- `SHARE_WITH_ME_ASR_URL`: OpenAI-compatible transcription endpoint
+- `SHARE_WITH_ME_ASR_MODEL`: default `whisper-1`
 
 ## Supabase Schema
 

@@ -1,0 +1,189 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub(crate) struct OriginalContent {
+    #[serde(default)]
+    pub(crate) format: String,
+    #[serde(default)]
+    pub(crate) plain_text: String,
+    #[serde(default)]
+    pub(crate) blocks: Vec<ContentBlock>,
+}
+
+impl OriginalContent {
+    pub(crate) fn from_plain_text(text: impl Into<String>) -> Self {
+        let plain_text = text.into().trim().to_string();
+        if plain_text.is_empty() {
+            return Self::default();
+        }
+        let blocks = plain_text
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|text| ContentBlock {
+                kind: "paragraph".to_string(),
+                text: text.to_string(),
+                ..ContentBlock::default()
+            })
+            .collect();
+        Self {
+            format: "blocks-v1".to_string(),
+            plain_text,
+            blocks,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.plain_text.trim().is_empty() && self.blocks.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub(crate) struct ContentBlock {
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) level: Option<u8>,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    #[serde(default)]
+    pub(crate) alt: Option<String>,
+    #[serde(default)]
+    pub(crate) items: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub(crate) struct MediaAsset {
+    pub(crate) kind: String,
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) cached_url: Option<String>,
+    #[serde(default)]
+    pub(crate) thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub(crate) alt: Option<String>,
+    #[serde(default)]
+    pub(crate) width: Option<u32>,
+    #[serde(default)]
+    pub(crate) height: Option<u32>,
+    #[serde(default)]
+    pub(crate) duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub(crate) struct SourceFact {
+    pub(crate) key: String,
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct ExtractionState {
+    pub(crate) status: String,
+    pub(crate) adapter: String,
+    pub(crate) method: String,
+    pub(crate) completeness: u8,
+    #[serde(default)]
+    pub(crate) fetched_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) refresh_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) content_fingerprint: Option<String>,
+    #[serde(default)]
+    pub(crate) last_error: Option<String>,
+}
+
+impl Default for ExtractionState {
+    fn default() -> Self {
+        Self {
+            status: "legacy".to_string(),
+            adapter: "legacy".to_string(),
+            method: "legacy".to_string(),
+            completeness: 0,
+            fetched_at: None,
+            refresh_after: None,
+            content_fingerprint: None,
+            last_error: None,
+        }
+    }
+}
+
+impl ExtractionState {
+    pub(crate) fn is_stale_at(&self, now: DateTime<Utc>) -> bool {
+        self.refresh_after
+            .is_none_or(|refresh_after| refresh_after <= now)
+    }
+}
+
+pub(crate) fn content_fingerprint(text: &str) -> String {
+    // Stable FNV-1a is sufficient for change detection and avoids a crypto dependency.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub(crate) fn snapshot_fingerprint(
+    title: &str,
+    author: Option<&str>,
+    text: &str,
+    facts: &[SourceFact],
+) -> Option<String> {
+    if title.trim().is_empty() && text.trim().is_empty() {
+        return None;
+    }
+    let mut stable_facts = facts
+        .iter()
+        .filter(|fact| {
+            !matches!(
+                fact.key.as_str(),
+                "view_count" | "like" | "favorite" | "danmaku" | "comment_count"
+            )
+        })
+        .map(|fact| format!("{}={}", fact.key.trim(), fact.value.trim()))
+        .collect::<Vec<_>>();
+    stable_facts.sort();
+    Some(content_fingerprint(&format!(
+        "title={}\nauthor={}\ntext={}\nfacts={}",
+        title.trim(),
+        author.unwrap_or_default().trim(),
+        text.trim(),
+        stable_facts.join("\n")
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourceFact, snapshot_fingerprint};
+
+    #[test]
+    fn snapshot_fingerprint_tracks_semantic_facts_but_not_view_counts() {
+        let base = vec![SourceFact {
+            key: "price".to_string(),
+            label: "价格".to_string(),
+            value: "99".to_string(),
+        }];
+        let first = snapshot_fingerprint("商品", None, "商品正文", &base);
+        let mut changed_price = base.clone();
+        changed_price[0].value = "109".to_string();
+        assert_ne!(
+            first,
+            snapshot_fingerprint("商品", None, "商品正文", &changed_price)
+        );
+
+        let mut changed_views = base.clone();
+        changed_views.push(SourceFact {
+            key: "view_count".to_string(),
+            label: "播放量".to_string(),
+            value: "1000".to_string(),
+        });
+        assert_eq!(
+            first,
+            snapshot_fingerprint("商品", None, "商品正文", &changed_views)
+        );
+    }
+}

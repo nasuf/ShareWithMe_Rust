@@ -8,6 +8,7 @@ pub(crate) struct AppConfig {
     pub(crate) bind_addr: SocketAddr,
     pub(crate) store: StoreConfig,
     pub(crate) media_path: PathBuf,
+    pub(crate) api_token: Option<String>,
     pub(crate) deepseek_api_key: Option<String>,
     pub(crate) deepseek_base_url: String,
     pub(crate) deepseek_model: String,
@@ -29,6 +30,10 @@ impl AppConfig {
         let media_path = env::var("SHARE_WITH_ME_MEDIA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("media"));
+        let api_token = env::var("SHARE_WITH_ME_API_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let deepseek_api_key = env::var("DEEPSEEK_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -42,6 +47,7 @@ impl AppConfig {
             bind_addr,
             store,
             media_path,
+            api_token,
             deepseek_api_key,
             deepseek_base_url,
             deepseek_model,

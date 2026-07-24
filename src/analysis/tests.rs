@@ -29,6 +29,7 @@ fn recognizes_toutiao_browser_challenge_pages() {
         image_url: None,
         content_text: "https://www.toutiao.com/article/7651359327906710016/".to_string(),
         original_text: "https://www.toutiao.com/article/7651359327906710016/".to_string(),
+        ..LinkMetadata::default()
     };
 
     merge_html_metadata(
@@ -57,6 +58,7 @@ fn keeps_shared_text_when_challenge_page_has_user_context() {
         image_url: None,
         content_text: "这是一条用户分享时带上的摘要".to_string(),
         original_text: "这是一条用户分享时带上的摘要".to_string(),
+        ..LinkMetadata::default()
     };
 
     merge_html_metadata(
@@ -85,6 +87,7 @@ fn blocked_toutiao_analysis_keeps_item_as_article() {
         image_url: None,
         content_text: "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。".to_string(),
         original_text: "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。".to_string(),
+        ..LinkMetadata::default()
     };
 
     let analysis = blocked_page_analysis(&metadata);
@@ -106,6 +109,7 @@ fn extracts_xiaohongshu_note_from_initial_state() {
         image_url: None,
         content_text: String::new(),
         original_text: String::new(),
+        ..LinkMetadata::default()
     };
 
     merge_html_metadata(
@@ -143,6 +147,7 @@ fn rendered_metadata_replaces_blocked_placeholder() {
         image_url: None,
         content_text: "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。".to_string(),
         original_text: "今日头条返回了浏览器验证页面，后端无法从公开网页直接抓取正文。".to_string(),
+        ..LinkMetadata::default()
     };
 
     merge_rendered_metadata(
@@ -179,6 +184,7 @@ fn xiaohongshu_ssr_content_does_not_trigger_browser_fallback() {
         content_text: "可可爱爱，格格脑袋～👧🏻 我的摄影学生帮我拍的 大家可以辣评一下🎙️".to_string(),
         original_text: "可可爱爱，格格脑袋～👧🏻\n\n我的摄影学生帮我拍的\n大家可以辣评一下🎙️"
             .to_string(),
+        ..LinkMetadata::default()
     };
 
     assert!(!should_try_rendered_extraction(&metadata));
@@ -501,6 +507,7 @@ fn parse_platform_fixture(url: &str, platform: &str, html: &str) -> LinkItem {
         image_url: None,
         content_text: String::new(),
         original_text: String::new(),
+        ..LinkMetadata::default()
     };
 
     merge_html_metadata(&mut metadata, html);
