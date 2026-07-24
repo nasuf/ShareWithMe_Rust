@@ -103,14 +103,13 @@ fn merge_classic_article(
 }
 
 fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
+    // `content_noencode` is mostly plain text but can embed inline HTML such as
+    // mini-program `<a data-miniprogram-applink=...>` links, so strip tags when
+    // present instead of leaking the raw markup into the snapshot.
     let body = cgi_string(html, "content_noencode")
+        .or_else(|| cgi_string(html, "content").filter(|value| value.contains('<')))
         .filter(|value| !value.trim().is_empty())
-        .map(|value| clean_original_text(&value))
-        .or_else(|| {
-            cgi_string(html, "content")
-                .filter(|value| value.contains('<'))
-                .map(|value| html_to_formatted_text(&value))
-        })
+        .map(|value| clean_body_text(&value))
         .filter(|value| !value.trim().is_empty());
 
     let raw_title = cgi_string(html, "msg_title").or_else(|| cgi_string(html, "title"));
@@ -466,6 +465,16 @@ fn decode_js_string(raw: &str) -> String {
     clean_original_text(&output)
 }
 
+/// Normalize a cgiData body: strip inline HTML (mini-program `<a>` links, spans)
+/// when present, otherwise just clean whitespace and entities.
+fn clean_body_text(value: &str) -> String {
+    if value.contains('<') {
+        html_to_formatted_text(value)
+    } else {
+        clean_original_text(value)
+    }
+}
+
 /// Turn literal escape sequences (the two characters `\` + `n`) into real
 /// whitespace. WeChat's `og:title` / `og:description` embed `\n` / `\r\n` / `\t`
 /// verbatim, which would otherwise be stored and displayed literally.
@@ -578,7 +587,7 @@ mod tests {
     fn extracts_new_style_article_from_cgi_data() {
         // Mirrors the Vue/picture-message layout: no `#js_content`, payload lives
         // in `window.cgiData` with `\x0a` escapes and single quotes.
-        let html = r#"
+        let html = r##"
             <html><head>
               <meta property="og:title" content="" />
               <meta property="og:image" content="" />
@@ -589,18 +598,26 @@ mod tests {
                   nick_name: '神仙外企',
                   create_timestamp: '1784865600',
                   author: '',
-                  content_noencode: '外企真的在撤离中国吗？\x0a\x0a如果认真看了近两年的财报，会发现并不是这样的。\x0a很多外企撤掉的，其实是利润低的传统业务。',
+                  content_noencode: '外企真的在撤离中国吗？\x0a\x0a如果认真看了近两年的财报，会发现并不是这样的。\x0a很多外企撤掉的，其实是利润低的传统业务。\x0a<a data-miniprogram-applink="#小程序://神仙外企/Lb9WsKYl1HQ4Pxb" class="weapp_text_link">点我免费领取《New外企招聘信息表》</a>',
                 };
                 msg_title = window.title = '外企真的在撤离中国吗？\x0a\x0a如果认真看了近两年的财报';
               </script>
             </body></html>
-        "#;
+        "##;
         let mut metadata = wechat_metadata();
         assert!(merge(&mut metadata, html));
         assert_eq!(metadata.title, "外企真的在撤离中国吗？");
         assert_eq!(metadata.author.as_deref(), Some("神仙外企"));
         assert!(metadata.content_text.contains("如果认真看了近两年的财报"));
         assert!(metadata.content_text.contains("利润低的传统业务"));
+        // Inline mini-program link markup is stripped, keeping the readable text.
+        assert!(
+            metadata
+                .content_text
+                .contains("点我免费领取《New外企招聘信息表》")
+        );
+        assert!(!metadata.content_text.contains("<a "));
+        assert!(!metadata.content_text.contains("data-miniprogram-applink"));
         assert!(
             metadata
                 .source_facts
