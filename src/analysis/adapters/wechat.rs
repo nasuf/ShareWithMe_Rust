@@ -3,7 +3,7 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::{
-    content::{MediaAsset, OriginalContent, SourceFact},
+    content::{ContentBlock, MediaAsset, OriginalContent, SourceFact},
     models::LinkMetadata,
 };
 
@@ -104,13 +104,18 @@ fn merge_classic_article(
 
 fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
     // `content_noencode` is mostly plain text but can embed inline HTML such as
-    // mini-program `<a data-miniprogram-applink=...>` links, so strip tags when
-    // present instead of leaking the raw markup into the snapshot.
-    let body = cgi_string(html, "content_noencode")
+    // mini-program `<a data-miniprogram-applink=...>` links. Keep the readable
+    // text and preserve those links as structured `link` blocks instead of
+    // leaking raw markup or dropping the link entirely.
+    let raw_body = cgi_string(html, "content_noencode")
         .or_else(|| cgi_string(html, "content").filter(|value| value.contains('<')))
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| clean_body_text(&value))
         .filter(|value| !value.trim().is_empty());
+    let (body_text, links) = match raw_body {
+        Some(raw) if raw.contains('<') => split_inline_links(&raw, &metadata.final_url),
+        Some(raw) => (clean_original_text(&raw), Vec::new()),
+        None => (String::new(), Vec::new()),
+    };
+    let has_content = !body_text.trim().is_empty() || !links.is_empty();
 
     let raw_title = cgi_string(html, "msg_title").or_else(|| cgi_string(html, "title"));
     let title = raw_title
@@ -118,7 +123,7 @@ fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
         .and_then(first_meaningful_line)
         .filter(|value| !value.is_empty());
 
-    if title.is_none() && body.is_none() {
+    if title.is_none() && !has_content {
         return false;
     }
 
@@ -130,10 +135,8 @@ fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
     let byline = cgi_string(html, "author").filter(|value| !value.trim().is_empty());
     set_author_facts(metadata, byline, account);
 
-    if let Some(body) = body {
-        metadata.original_text = body.clone();
-        metadata.original_content = OriginalContent::from_plain_text(&body);
-        metadata.content_text = clean_text(&body);
+    if has_content {
+        apply_body_with_links(metadata, &body_text, &links);
     }
     set_description(metadata, None);
 
@@ -465,14 +468,69 @@ fn decode_js_string(raw: &str) -> String {
     clean_original_text(&output)
 }
 
-/// Normalize a cgiData body: strip inline HTML (mini-program `<a>` links, spans)
-/// when present, otherwise just clean whitespace and entities.
-fn clean_body_text(value: &str) -> String {
-    if value.contains('<') {
-        html_to_formatted_text(value)
-    } else {
-        clean_original_text(value)
+/// Split inline `<a>` links out of a WeChat body fragment. Returns the plain
+/// body text (anchors removed) plus the extracted `(text, target)` links.
+///
+/// A standard `http(s)` href is used as-is; a mini-program link (no usable web
+/// href, e.g. `data-miniprogram-applink="#小程序://..."`) falls back to the
+/// article URL so the client can hand off to WeChat, mirroring how the browser
+/// prompts "open in WeChat" for these links.
+fn split_inline_links(raw: &str, article_url: &str) -> (String, Vec<(String, String)>) {
+    let Ok(anchor) = Regex::new(r"(?is)<a\b([^>]*)>(.*?)</a>") else {
+        return (html_to_formatted_text(raw), Vec::new());
+    };
+    let mut links = Vec::new();
+    let stripped = anchor.replace_all(raw, |caps: &regex::Captures<'_>| {
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let inner = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let text = html_to_formatted_text(inner);
+        if text.trim().is_empty() {
+            return String::new();
+        }
+        let target = anchor_http_href(attrs).unwrap_or_else(|| article_url.to_string());
+        links.push((text, target));
+        // Remove the anchor from the flowing text; it is re-added as a block.
+        String::new()
+    });
+    (html_to_formatted_text(&stripped), links)
+}
+
+/// A real, openable web href from an anchor's attributes (mini-program `#小程序://`
+/// links have no usable web URL, so those return `None`).
+fn anchor_http_href(attrs: &str) -> Option<String> {
+    let raw = Regex::new(r#"(?i)\bhref\s*=\s*["']([^"']+)["']"#)
+        .ok()?
+        .captures(attrs)?
+        .get(1)?
+        .as_str();
+    let href = normalize_wechat_url(raw);
+    href.starts_with("http").then_some(href)
+}
+
+/// Apply the plain body as paragraphs and append the preserved links as trailing
+/// `link` blocks (WeChat drainage links sit at the end of the article).
+fn apply_body_with_links(metadata: &mut LinkMetadata, body_text: &str, links: &[(String, String)]) {
+    let mut content = OriginalContent::from_plain_text(body_text);
+    let mut plain = content.plain_text.clone();
+    for (text, url) in links {
+        content.blocks.push(ContentBlock {
+            kind: "link".to_string(),
+            text: text.clone(),
+            url: Some(url.clone()),
+            ..ContentBlock::default()
+        });
+        if !plain.is_empty() {
+            plain.push_str("\n\n");
+        }
+        plain.push_str(text);
     }
+    if content.format.is_empty() {
+        content.format = "blocks-v1".to_string();
+    }
+    content.plain_text = plain.clone();
+    metadata.original_content = content;
+    metadata.original_text = plain.clone();
+    metadata.content_text = clean_text(&plain);
 }
 
 /// Turn literal escape sequences (the two characters `\` + `n`) into real
@@ -618,6 +676,16 @@ mod tests {
         );
         assert!(!metadata.content_text.contains("<a "));
         assert!(!metadata.content_text.contains("data-miniprogram-applink"));
+        // The link is preserved as a structured `link` block; a mini-program
+        // link (no http href) targets the article URL for a WeChat hand-off.
+        let link = metadata
+            .original_content
+            .blocks
+            .iter()
+            .find(|block| block.kind == "link")
+            .expect("a link block");
+        assert!(link.text.contains("点我免费领取《New外企招聘信息表》"));
+        assert_eq!(link.url.as_deref(), Some(metadata.final_url.as_str()));
         assert!(
             metadata
                 .source_facts
