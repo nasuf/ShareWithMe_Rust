@@ -44,12 +44,13 @@ impl SupabaseStore {
         Ok(store)
     }
 
-    pub(super) async fn save_item(&self, mut item: LinkItem) -> Result<()> {
+    pub(super) async fn save_item(&self, mut item: LinkItem) -> Result<LinkItem> {
         if let Some(existing) = self.find_by_identity(&item.id, &item.final_url).await? {
             item.id = existing.id;
             item.created_at = existing.created_at;
         }
-        self.upsert_item(&item).await
+        self.upsert_item(&item).await?;
+        Ok(item)
     }
 
     pub(super) async fn all_items(&self) -> Result<Vec<LinkItem>> {

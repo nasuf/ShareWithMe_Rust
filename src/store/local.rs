@@ -33,10 +33,11 @@ impl LocalStore {
         }
     }
 
-    pub(super) fn save_item(&self, item: LinkItem) -> Result<()> {
+    pub(super) fn save_item(&self, item: LinkItem) -> Result<LinkItem> {
         let mut items = self.items()?;
-        save_into_vec(&mut items, item);
-        self.persist(&items)
+        let (stored, _) = save_into_vec(&mut items, item);
+        self.persist(&items)?;
+        Ok(stored)
     }
 
     pub(super) fn all_items(&self) -> Result<Vec<LinkItem>> {
@@ -49,7 +50,7 @@ impl LocalStore {
         let mut merged = 0;
 
         for item in incoming {
-            if save_into_vec(&mut items, item) {
+            if save_into_vec(&mut items, item).1 {
                 merged += 1;
             } else {
                 created += 1;
@@ -95,23 +96,25 @@ impl LocalStore {
     }
 }
 
-fn save_into_vec(items: &mut Vec<LinkItem>, mut item: LinkItem) -> bool {
+// Returns the stored item (with any reused id/created_at) and whether it merged
+// into an existing row.
+fn save_into_vec(items: &mut Vec<LinkItem>, mut item: LinkItem) -> (LinkItem, bool) {
     let mut merged = true;
     if let Some(existing) = items.iter_mut().find(|existing| existing.id == item.id) {
-        *existing = item;
+        *existing = item.clone();
     } else if let Some(existing) = items
         .iter_mut()
         .find(|existing| existing.final_url == item.final_url)
     {
         item.id = existing.id.clone();
         item.created_at = existing.created_at;
-        *existing = item;
+        *existing = item.clone();
     } else {
-        items.push(item);
+        items.push(item.clone());
         merged = false;
     }
     sort_items(items);
-    merged
+    (item, merged)
 }
 
 fn sort_items(items: &mut [LinkItem]) {

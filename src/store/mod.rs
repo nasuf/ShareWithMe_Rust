@@ -51,7 +51,7 @@ impl Store {
         }
     }
 
-    async fn save_item(&self, item: LinkItem) -> Result<()> {
+    async fn save_item(&self, item: LinkItem) -> Result<LinkItem> {
         match &self.backend {
             StoreBackend::Local(store) => store.save_item(item),
             StoreBackend::Supabase(store) => store.save_item(item).await,
@@ -93,7 +93,8 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("item not found"))?;
         item.status = status.to_string();
         item.updated_at = Utc::now();
-        self.save_item(item).await
+        self.save_item(item).await?;
+        Ok(())
     }
 
     async fn update_item_metadata(&self, id: &str, request: UpdateItemRequest) -> Result<LinkItem> {
@@ -145,7 +146,7 @@ impl Store {
     }
 }
 
-pub(crate) async fn save_item(store: &Arc<Store>, item: LinkItem) -> Result<()> {
+pub(crate) async fn save_item(store: &Arc<Store>, item: LinkItem) -> Result<LinkItem> {
     store.save_item(item).await
 }
 

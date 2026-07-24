@@ -171,15 +171,17 @@ async fn analyze_one_url(
     };
     let mut item = build_item(metadata.clone(), analysis, request.source_app.clone());
     item.analysis_pending = defer_ai;
-    save_item(&state.store, item.clone())
+    // Use the persisted item: when the final_url already exists the store reuses
+    // the existing id, and the background task must target that real id.
+    let stored = save_item(&state.store, item)
         .await
         .map_err(ApiError::internal)?;
     if defer_ai {
-        spawn_deferred_analysis(state.clone(), item.id.clone(), metadata);
+        spawn_deferred_analysis(state.clone(), stored.id.clone(), metadata);
     } else {
-        schedule_media_cache(state.clone(), item.id.clone());
+        schedule_media_cache(state.clone(), stored.id.clone());
     }
-    Ok(item)
+    Ok(stored)
 }
 
 // Cache media, then run the LLM analysis, then apply it with a fresh read so the
