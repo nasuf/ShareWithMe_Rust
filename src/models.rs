@@ -73,6 +73,10 @@ pub(crate) struct LinkItem {
     pub(crate) content_type: String,
     pub(crate) importance_score: u8,
     pub(crate) notes: String,
+    // True while AI analysis is still running in the background; the client can
+    // show a pending state and refresh when it clears.
+    #[serde(default)]
+    pub(crate) analysis_pending: bool,
     #[serde(default)]
     pub(crate) user_edited_at: Option<DateTime<Utc>>,
     pub(crate) status: String,

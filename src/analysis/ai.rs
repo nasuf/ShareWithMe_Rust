@@ -178,7 +178,7 @@ struct DeepSeekMessage {
     content: String,
 }
 
-pub(super) fn heuristic_analysis(metadata: &LinkMetadata, note: &str) -> LinkAnalysis {
+pub(crate) fn heuristic_analysis(metadata: &LinkMetadata, note: &str) -> LinkAnalysis {
     let text = format!(
         "{} {} {}",
         metadata.title, metadata.description, metadata.content_text
@@ -301,6 +301,7 @@ pub(crate) fn build_item(
         content_type: analysis.content_type,
         importance_score: analysis.importance_score,
         notes: analysis.notes,
+        analysis_pending: false,
         user_edited_at: None,
         status: "active".to_string(),
         created_at: now,

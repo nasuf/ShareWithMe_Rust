@@ -153,7 +153,7 @@ async fn cache_cover_image(
     .await
 }
 
-async fn cache_item_media(state: &AppState, item_id: &str) -> anyhow::Result<()> {
+pub(super) async fn cache_item_media(state: &AppState, item_id: &str) -> anyhow::Result<()> {
     let Some(mut item) = find_item(&state.store, item_id).await? else {
         return Ok(());
     };

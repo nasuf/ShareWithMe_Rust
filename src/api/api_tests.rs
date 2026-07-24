@@ -64,6 +64,7 @@ async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
         content_type: "note".to_string(),
         importance_score: 60,
         notes: String::new(),
+        analysis_pending: false,
         user_edited_at: None,
         status: "active".to_string(),
         created_at: now,

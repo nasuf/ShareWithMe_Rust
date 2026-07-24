@@ -509,6 +509,7 @@ mod tests {
             content_type: "link".to_string(),
             importance_score: 50,
             notes: String::new(),
+            analysis_pending: false,
             user_edited_at: None,
             status: "active".to_string(),
             created_at: now,

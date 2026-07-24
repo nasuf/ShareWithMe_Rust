@@ -13,8 +13,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     analysis::{
         analyze_with_deepseek_or_fallback, build_item, check_deepseek, extract_metadata,
-        extract_metadata_with_video_transcription, is_safe_remote_url, resolve_request_url,
-        resolve_request_urls,
+        extract_metadata_with_video_transcription, heuristic_analysis, is_safe_remote_url,
+        resolve_request_url, resolve_request_urls,
     },
     config::AppConfig,
     content::snapshot_fingerprint,
@@ -22,8 +22,8 @@ use crate::{
     error::ApiError,
     models::{
         AnalyzeLinkRequest, AnalyzerCheckResponse, CollectionDigest, CollectionStats,
-        HealthResponse, JsonImportRequest, JsonImportResponse, LinkItem, LinkMetadata,
-        ListItemsQuery, UpdateItemRequest, UpdateStatusRequest,
+        HealthResponse, JsonImportRequest, JsonImportResponse, LinkAnalysis, LinkItem,
+        LinkMetadata, ListItemsQuery, UpdateItemRequest, UpdateStatusRequest,
     },
     state::AppState,
     store::{
@@ -159,13 +159,64 @@ async fn analyze_one_url(
     request: &AnalyzeLinkRequest,
 ) -> Result<LinkItem, ApiError> {
     let metadata = extract_metadata(&state.http, source_url, request.shared_text.as_deref()).await;
-    let analysis = analyze_with_deepseek_or_fallback(state, &metadata).await;
-    let item = build_item(metadata, analysis, request.source_app.clone());
+
+    // LLM analysis dominates the request time (~6-7s vs ~1s for extraction), so
+    // when DeepSeek is configured we return a fast local snapshot immediately and
+    // run the real analysis in the background, clearing `analysis_pending` when done.
+    let defer_ai = state.config.deepseek_api_key.is_some();
+    let analysis = if defer_ai {
+        heuristic_analysis(&metadata, "AI 分析生成中…")
+    } else {
+        analyze_with_deepseek_or_fallback(state, &metadata).await
+    };
+    let mut item = build_item(metadata.clone(), analysis, request.source_app.clone());
+    item.analysis_pending = defer_ai;
     save_item(&state.store, item.clone())
         .await
         .map_err(ApiError::internal)?;
-    schedule_media_cache(state.clone(), item.id.clone());
+    if defer_ai {
+        spawn_deferred_analysis(state.clone(), item.id.clone(), metadata);
+    } else {
+        schedule_media_cache(state.clone(), item.id.clone());
+    }
     Ok(item)
+}
+
+// Cache media, then run the LLM analysis, then apply it with a fresh read so the
+// two background writes (media cache and AI) do not clobber each other.
+fn spawn_deferred_analysis(state: AppState, item_id: String, metadata: LinkMetadata) {
+    tokio::spawn(async move {
+        if let Err(error) = media::cache_item_media(&state, &item_id).await {
+            tracing::warn!(item_id, %error, "cache item media failed");
+        }
+        let analysis = analyze_with_deepseek_or_fallback(&state, &metadata).await;
+        match find_item(&state.store, &item_id).await {
+            Ok(Some(mut item)) => {
+                apply_deferred_analysis(&mut item, analysis);
+                if let Err(error) = save_item(&state.store, item).await {
+                    tracing::warn!(item_id, %error, "save deferred analysis failed");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(item_id, %error, "reload for deferred analysis failed"),
+        }
+    });
+}
+
+fn apply_deferred_analysis(item: &mut LinkItem, analysis: LinkAnalysis) {
+    item.summary = analysis.summary;
+    item.sentiment = analysis.sentiment;
+    item.content_type = analysis.content_type;
+    item.importance_score = analysis.importance_score;
+    item.notes = analysis.notes;
+    // Preserve any classification the user edited before analysis finished.
+    if item.user_edited_at.is_none() {
+        item.category = analysis.category;
+        item.keywords = analysis.keywords;
+        item.entities = analysis.entities;
+    }
+    item.analysis_pending = false;
+    item.updated_at = Utc::now();
 }
 
 async fn reanalyze_item(

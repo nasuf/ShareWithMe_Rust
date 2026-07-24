@@ -11,7 +11,9 @@ mod platform_tests;
 mod tests;
 mod url;
 
-pub(crate) use ai::{analyze_with_deepseek_or_fallback, build_item, check_deepseek};
+pub(crate) use ai::{
+    analyze_with_deepseek_or_fallback, build_item, check_deepseek, heuristic_analysis,
+};
 pub(crate) use classify::{clean_text, truncate_chars};
 #[cfg(test)]
 pub(crate) use classify::{infer_category, infer_content_type, platform_for_url};
