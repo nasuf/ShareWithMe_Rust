@@ -166,7 +166,22 @@ jobs:
           systemctl daemon-reload
           systemctl enable "$SERVICE_NAME"
           systemctl restart "$SERVICE_NAME"
-          sleep 2
-          curl --fail --silent --show-error "http://127.0.0.1:${SHARE_WITH_ME_BIND##*:}/health"
+
+          # The Supabase-backed startup can take longer than a couple of seconds,
+          # so poll the health endpoint instead of a single fixed sleep.
+          health_url="http://127.0.0.1:${SHARE_WITH_ME_BIND##*:}/health"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "$health_url" >/dev/null; then
+              echo "backend healthy after ${attempt} attempt(s)"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "backend did not become healthy within 60s" >&2
+              journalctl -u "$SERVICE_NAME" --no-pager -n 80 || true
+              systemctl --no-pager --full status "$SERVICE_NAME" || true
+              exit 1
+            fi
+            sleep 2
+          done
           systemctl --no-pager --full status "$SERVICE_NAME"
           REMOTE
