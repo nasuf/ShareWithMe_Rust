@@ -44,7 +44,14 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
     }
 
     // New-style / picture messages keep the payload in `window.cgiData`.
-    merge_from_cgi_data(metadata, html)
+    if merge_from_cgi_data(metadata, html) {
+        return true;
+    }
+
+    // Last resort: some servers (e.g. datacenter IPs) only receive the Open
+    // Graph meta page. WeChat crams the whole share-card text into `og:title`
+    // with literal `\n` escapes, so normalise those and derive a clean title.
+    merge_from_open_graph(metadata, &document)
 }
 
 fn merge_classic_article(
@@ -54,7 +61,9 @@ fn merge_classic_article(
     html: &str,
 ) {
     if let Some(title) = select_text(document, "#activity-name")
-        .or_else(|| meta_content(document, "meta[property='og:title']"))
+        .or_else(|| {
+            meta_content(document, "meta[property='og:title']").map(|v| unescape_literal_ws(&v))
+        })
         .filter(|value| !value.is_empty())
     {
         metadata.title = title;
@@ -76,7 +85,8 @@ fn merge_classic_article(
     }
 
     let og_description = meta_content(document, "meta[property='og:description']")
-        .or_else(|| meta_content(document, "meta[name='description']"));
+        .or_else(|| meta_content(document, "meta[name='description']"))
+        .map(|value| unescape_literal_ws(&value));
     set_description(metadata, og_description);
 
     let cover = meta_content(document, "meta[property='og:image']")
@@ -154,8 +164,54 @@ fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
     true
 }
 
+fn merge_from_open_graph(metadata: &mut LinkMetadata, document: &Html) -> bool {
+    let og_title = meta_content(document, "meta[property='og:title']")
+        .map(|value| unescape_literal_ws(&value))
+        .filter(|value| !value.trim().is_empty());
+    let og_description = meta_content(document, "meta[property='og:description']")
+        .or_else(|| meta_content(document, "meta[name='description']"))
+        .map(|value| unescape_literal_ws(&value))
+        .filter(|value| !value.trim().is_empty());
+
+    if og_title.is_none() && og_description.is_none() {
+        return false;
+    }
+
+    // The body is whichever field carries the most text; the title is its first
+    // meaningful line so a long share-card caption never becomes the headline.
+    let body = [og_title.as_deref(), og_description.as_deref()]
+        .into_iter()
+        .flatten()
+        .max_by_key(|value| value.chars().count())
+        .map(clean_original_text)
+        .filter(|value| !value.trim().is_empty());
+
+    if let Some(title) = og_title
+        .as_deref()
+        .or(body.as_deref())
+        .and_then(first_meaningful_line)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.title = title;
+    }
+    if let Some(body) = body {
+        metadata.original_text = body.clone();
+        metadata.original_content = OriginalContent::from_plain_text(&body);
+        metadata.content_text = clean_text(&body);
+    }
+    set_description(metadata, og_description);
+    set_cover(
+        metadata,
+        meta_content(document, "meta[property='og:image']"),
+    );
+
+    true
+}
+
 fn set_author_facts(metadata: &mut LinkMetadata, byline: Option<String>, account: Option<String>) {
-    let byline = byline.map(|value| clean_text(&value)).filter(|v| !v.is_empty());
+    let byline = byline
+        .map(|value| clean_text(&value))
+        .filter(|v| !v.is_empty());
     let account = account
         .map(|value| clean_text(&value))
         .filter(|v| !v.is_empty());
@@ -211,7 +267,11 @@ fn push_media(metadata: &mut LinkMetadata, asset: MediaAsset) {
     if !asset.url.starts_with("http") {
         return;
     }
-    if !metadata.media.iter().any(|existing| existing.url == asset.url) {
+    if !metadata
+        .media
+        .iter()
+        .any(|existing| existing.url == asset.url)
+    {
         metadata.media.push(asset);
     }
 }
@@ -406,6 +466,17 @@ fn decode_js_string(raw: &str) -> String {
     clean_original_text(&output)
 }
 
+/// Turn literal escape sequences (the two characters `\` + `n`) into real
+/// whitespace. WeChat's `og:title` / `og:description` embed `\n` / `\r\n` / `\t`
+/// verbatim, which would otherwise be stored and displayed literally.
+fn unescape_literal_ws(value: &str) -> String {
+    value
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\\t", " ")
+}
+
 fn push_fact(metadata: &mut LinkMetadata, key: &str, label: &str, value: String) {
     let value = clean_text(&value);
     if value.is_empty() || metadata.source_facts.iter().any(|fact| fact.key == key) {
@@ -551,6 +622,28 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_open_graph_and_normalizes_literal_newlines() {
+        // Datacenter/blocked variant: only `og:` meta with literal `\n` escapes
+        // and the whole caption stuffed into og:title.
+        let html = r#"
+            <html><head>
+              <meta property="og:title" content="外企真的在撤离中国吗？\n\n如果认真看了近两年的财报，会发现并不是这样的。\n很多外企撤掉的，其实是利润低的传统业务。" />
+              <meta property="og:image" content="https://mmbiz.qpic.cn/cover.jpg" />
+            </head><body><div id="page_content"></div></body></html>
+        "#;
+        let mut metadata = wechat_metadata();
+        assert!(merge(&mut metadata, html));
+        assert_eq!(metadata.title, "外企真的在撤离中国吗？");
+        assert!(!metadata.title.contains("\\n"));
+        assert!(!metadata.content_text.contains("\\n"));
+        assert!(metadata.content_text.contains("如果认真看了近两年的财报"));
+        assert_eq!(
+            metadata.image_url.as_deref(),
+            Some("https://mmbiz.qpic.cn/cover.jpg")
+        );
+    }
+
+    #[test]
     fn reports_deleted_article() {
         let html = r#"<html><body><div class="weui-msg__title warn">该内容已被发布者删除</div></body></html>"#;
         let mut metadata = wechat_metadata();
@@ -560,7 +653,8 @@ mod tests {
 
     #[test]
     fn skips_non_article_pages() {
-        let html = r#"<html><body><div id="verify">环境异常，完成验证后即可继续访问</div></body></html>"#;
+        let html =
+            r#"<html><body><div id="verify">环境异常，完成验证后即可继续访问</div></body></html>"#;
         let mut metadata = wechat_metadata();
         assert!(!merge(&mut metadata, html));
     }
