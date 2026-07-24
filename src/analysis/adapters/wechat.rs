@@ -36,11 +36,15 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
         return true;
     }
 
-    let document = Html::parse_document(html);
-
-    if let Some(content_element) = select_one(&document, "#js_content") {
-        merge_classic_article(metadata, &document, content_element, html);
-        return true;
+    // Only classic articles are server-rendered and worth building a full DOM
+    // for. WeChat's new-style/picture pages can be ~2MB, so we avoid parsing
+    // them entirely and read `window.cgiData` / Open Graph via regex instead.
+    if html.contains(r#"id="js_content""#) {
+        let document = Html::parse_document(html);
+        if let Some(content_element) = select_one(&document, "#js_content") {
+            merge_classic_article(metadata, &document, content_element, html);
+            return true;
+        }
     }
 
     // New-style / picture messages keep the payload in `window.cgiData`.
@@ -51,7 +55,7 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
     // Last resort: some servers (e.g. datacenter IPs) only receive the Open
     // Graph meta page. WeChat crams the whole share-card text into `og:title`
     // with literal `\n` escapes, so normalise those and derive a clean title.
-    merge_from_open_graph(metadata, &document)
+    merge_from_open_graph(metadata, html)
 }
 
 fn merge_classic_article(
@@ -140,7 +144,7 @@ fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
     }
     set_description(metadata, None);
 
-    let cover = meta_content_from_html(html, "og:image")
+    let cover = og_meta(html, "og:image")
         .or_else(|| cgi_url(html, "cdn_url"))
         .or_else(|| js_url_var(html, "msg_cdn_url"));
     set_cover(metadata, cover);
@@ -166,12 +170,12 @@ fn merge_from_cgi_data(metadata: &mut LinkMetadata, html: &str) -> bool {
     true
 }
 
-fn merge_from_open_graph(metadata: &mut LinkMetadata, document: &Html) -> bool {
-    let og_title = meta_content(document, "meta[property='og:title']")
+fn merge_from_open_graph(metadata: &mut LinkMetadata, html: &str) -> bool {
+    let og_title = og_meta(html, "og:title")
         .map(|value| unescape_literal_ws(&value))
         .filter(|value| !value.trim().is_empty());
-    let og_description = meta_content(document, "meta[property='og:description']")
-        .or_else(|| meta_content(document, "meta[name='description']"))
+    let og_description = og_meta(html, "og:description")
+        .or_else(|| og_meta(html, "description"))
         .map(|value| unescape_literal_ws(&value))
         .filter(|value| !value.trim().is_empty());
 
@@ -202,10 +206,7 @@ fn merge_from_open_graph(metadata: &mut LinkMetadata, document: &Html) -> bool {
         metadata.content_text = clean_text(&body);
     }
     set_description(metadata, og_description);
-    set_cover(
-        metadata,
-        meta_content(document, "meta[property='og:image']"),
-    );
+    set_cover(metadata, og_meta(html, "og:image"));
 
     true
 }
@@ -575,11 +576,26 @@ fn meta_content(document: &Html, selector: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn meta_content_from_html(html: &str, property: &str) -> Option<String> {
-    meta_content(
-        &Html::parse_document(html),
-        &format!("meta[property='{property}']"),
-    )
+/// Read an Open Graph / meta tag's `content` via regex, so cgiData and OG-only
+/// pages never pay for building a full DOM. Handles either attribute order and
+/// both quote styles.
+fn og_meta(html: &str, property: &str) -> Option<String> {
+    let key = regex::escape(property);
+    let patterns = [
+        format!(r#"<meta[^>]+(?:property|name)=["']{key}["'][^>]*\bcontent=["']([^"']*)["']"#),
+        format!(r#"<meta[^>]+\bcontent=["']([^"']*)["'][^>]*(?:property|name)=["']{key}["']"#),
+    ];
+    for pattern in patterns {
+        if let Ok(regex) = Regex::new(&pattern)
+            && let Some(value) = regex.captures(html).and_then(|caps| caps.get(1))
+        {
+            let value = value.as_str().trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
