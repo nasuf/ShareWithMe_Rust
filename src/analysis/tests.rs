@@ -136,6 +136,38 @@ fn extracts_xiaohongshu_note_from_initial_state() {
 }
 
 #[test]
+fn xiaohongshu_note_keeps_sharp_image_and_drops_blurry_preview() {
+    let mut metadata = LinkMetadata {
+        source_url: "https://www.xiaohongshu.com/explore/abc123".to_string(),
+        final_url: "https://www.xiaohongshu.com/explore/abc123".to_string(),
+        platform: "小红书".to_string(),
+        title: "未命名链接".to_string(),
+        ..LinkMetadata::default()
+    };
+
+    merge_html_metadata(
+        &mut metadata,
+        r#"<script>window.__INITIAL_STATE__={"note":{"noteDetailMap":{"abc123":{"note":{"title":"番茄酿肉","user":{"nickname":"厨师"},"imageList":[{"urlPre":"http:\/\/example.com\/blurry.jpg","urlDefault":"http:\/\/example.com\/sharp.jpg"}],"desc":"家常菜做法","noteId":"abc123"}}}}};</script>"#,
+    );
+
+    let image_urls = metadata
+        .media
+        .iter()
+        .map(|asset| asset.url.as_str())
+        .collect::<Vec<_>>();
+    assert!(image_urls.contains(&"http://example.com/sharp.jpg"));
+    assert!(!image_urls.contains(&"http://example.com/blurry.jpg"));
+    assert_eq!(
+        metadata
+            .media
+            .iter()
+            .filter(|asset| asset.kind == "image")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn rendered_metadata_replaces_blocked_placeholder() {
     let mut metadata = LinkMetadata {
         source_url: "https://www.toutiao.com/article/7651359327906710016/".to_string(),

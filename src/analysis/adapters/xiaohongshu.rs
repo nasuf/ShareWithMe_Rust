@@ -65,7 +65,14 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
     if let Some(image_url) = image_url.filter(|value| !value.trim().is_empty()) {
         metadata.image_url = Some(image_url);
     }
-    for image_url in string_fields(section, &["urlDefault", "urlPre"]) {
+    // Each image exposes both `urlDefault` (sharp) and `urlPre` (a blurry
+    // preview) of the SAME picture, so collecting both duplicates every image.
+    // Prefer the sharp URLs and only fall back to previews if none exist.
+    let mut image_urls = string_fields(section, &["urlDefault"]);
+    if image_urls.is_empty() {
+        image_urls = string_fields(section, &["urlPre"]);
+    }
+    for image_url in image_urls {
         if !metadata.media.iter().any(|asset| asset.url == image_url) {
             metadata.media.push(MediaAsset {
                 kind: "image".to_string(),
