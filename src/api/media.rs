@@ -1,3 +1,8 @@
+use std::{
+    collections::HashSet,
+    sync::{LazyLock, Mutex},
+};
+
 use anyhow::Context;
 use axum::{
     Json,
@@ -12,8 +17,10 @@ use url::Url;
 
 use crate::{
     analysis::{extract_metadata_with_video_transcription, is_safe_remote_url},
+    content::{ArchiveSnapshot, content_fingerprint, media_identity},
     error::ApiError,
     models::LinkItem,
+    render::render_snapshot,
     state::AppState,
     store::{find_item, save_item, update_item_cover},
 };
@@ -21,6 +28,9 @@ use crate::{
 use super::RefreshQuery;
 
 const COVER_REFRESH_COOLDOWN: Duration = Duration::hours(6);
+// Inline article images; source CDNs (e.g. Toutiao) sign URLs that expire, so
+// anything not cached locally eventually stops rendering.
+const MAX_CACHED_IMAGES: usize = 40;
 
 pub(super) async fn refresh_cover(
     State(state): State<AppState>,
@@ -90,7 +100,117 @@ pub(super) fn schedule_media_cache(state: AppState, item_id: String) {
         if let Err(error) = cache_item_media(&state, &item_id).await {
             tracing::warn!(item_id, %error, "cache item media failed");
         }
+        ensure_archive(&state, &item_id).await;
     });
+}
+
+// Capture the visual archive once, in the background, while the source is
+// still reachable. Failures are logged; the next refresh will retry.
+pub(super) async fn ensure_archive(state: &AppState, item_id: &str) {
+    if let Err(error) = capture_archive(state, item_id, false).await {
+        tracing::warn!(item_id, %error, "capture archive snapshot failed");
+    }
+}
+
+pub(super) async fn recapture_archive(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<LinkItem>, ApiError> {
+    find_item(&state.store, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("item not found"))?;
+    match capture_archive(&state, &id, true).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ApiError::bad_request("原链接当前无法生成存档快照")),
+        Err(error) => return Err(ApiError::internal(error)),
+    }
+    let item = find_item(&state.store, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("item not found"))?;
+    Ok(Json(item))
+}
+
+static ARCHIVES_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+// Returns Ok(true) when a new snapshot was stored.
+async fn capture_archive(state: &AppState, item_id: &str, force: bool) -> anyhow::Result<bool> {
+    let Some(item) = find_item(&state.store, item_id).await? else {
+        return Ok(false);
+    };
+    if (!force && item.archive.is_some()) || !archivable(&item) {
+        return Ok(false);
+    }
+    {
+        let mut in_flight = ARCHIVES_IN_FLIGHT
+            .lock()
+            .map_err(|_| anyhow::anyhow!("archive lock poisoned"))?;
+        if !in_flight.insert(item_id.to_string()) {
+            return Ok(false);
+        }
+    }
+    let result = capture_archive_file(state, &item).await;
+    if let Ok(mut in_flight) = ARCHIVES_IN_FLIGHT.lock() {
+        in_flight.remove(item_id);
+    }
+    result
+}
+
+fn archivable(item: &LinkItem) -> bool {
+    // A captcha wall or a "deleted" notice is not worth archiving.
+    !matches!(item.extraction.status.as_str(), "blocked")
+        && Url::parse(&item.final_url)
+            .ok()
+            .is_some_and(|url| is_safe_remote_url(&url))
+}
+
+async fn capture_archive_file(state: &AppState, item: &LinkItem) -> anyhow::Result<bool> {
+    tokio::fs::create_dir_all(&state.config.media_path)
+        .await
+        .context("create media directory")?;
+    // A fresh name per capture: media is served as immutable, so overwriting a
+    // file in place would leave clients showing the stale image.
+    let captured_at = Utc::now();
+    let file_name = format!(
+        "snapshot-{}-{}.jpg",
+        safe_file_id(&item.id),
+        captured_at.timestamp()
+    );
+    let path = state.config.media_path.join(&file_name);
+    let Some(rendered) = render_snapshot(&item.final_url, &path).await else {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(false);
+    };
+    let (Some(width), Some(height)) = (rendered.snapshot_width, rendered.snapshot_height) else {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(false);
+    };
+
+    // Re-read so the background media/AI writes are not overwritten.
+    let Some(mut current) = find_item(&state.store, &item.id).await? else {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(false);
+    };
+    let previous = current.archive.replace(ArchiveSnapshot {
+        kind: "screenshot".to_string(),
+        url: format!("/media/{file_name}"),
+        width,
+        height,
+        source_url: item.final_url.clone(),
+        captured_at,
+    });
+    current.updated_at = Utc::now();
+    save_item(&state.store, current).await?;
+    if let Some(old_file) = previous
+        .as_ref()
+        .and_then(|archive| archive.url.strip_prefix("/media/"))
+        .filter(|old| *old != file_name && !old.contains('/'))
+    {
+        let _ = tokio::fs::remove_file(state.config.media_path.join(old_file)).await;
+    }
+    Ok(true)
 }
 
 pub(super) fn is_local_media_url(url: &str) -> bool {
@@ -182,12 +302,18 @@ pub(super) async fn cache_item_media(state: &AppState, item_id: &str) -> anyhow:
             asset.kind == "image" && asset.cached_url.is_none() && !is_local_media_url(&asset.url)
         })
         .map(|(index, _)| index)
-        .take(6)
+        .take(MAX_CACHED_IMAGES)
         .collect::<Vec<_>>();
     let mut changed = false;
     for index in image_indexes {
         let remote_url = item.media[index].url.clone();
-        let file_name = format!("asset-{}-{index}.jpg", safe_file_id(item_id));
+        // Keyed by URL, not position: a refresh can reorder `media`, and an
+        // index-based name would overwrite a file another asset still uses.
+        let file_name = format!(
+            "asset-{}-{}.jpg",
+            safe_file_id(item_id),
+            content_fingerprint(&media_identity(&remote_url))
+        );
         match cache_remote_image(state, &file_name, &remote_url, 1200).await {
             Ok(local_url) => {
                 item.media[index].cached_url = Some(local_url.clone());

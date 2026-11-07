@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::content::{ExtractionState, MediaAsset, OriginalContent, SourceFact};
+use crate::content::{ArchiveSnapshot, ExtractionState, MediaAsset, OriginalContent, SourceFact};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnalyzeLinkRequest {
@@ -65,6 +65,8 @@ pub(crate) struct LinkItem {
     pub(crate) published_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub(crate) extraction: ExtractionState,
+    #[serde(default)]
+    pub(crate) archive: Option<ArchiveSnapshot>,
     pub(crate) summary: String,
     pub(crate) category: String,
     pub(crate) keywords: Vec<String>,

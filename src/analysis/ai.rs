@@ -293,6 +293,7 @@ pub(crate) fn build_item(
         source_id: metadata.source_id,
         published_at: metadata.published_at,
         extraction: metadata.extraction,
+        archive: None,
         summary: analysis.summary,
         category: analysis.category,
         keywords: analysis.keywords,

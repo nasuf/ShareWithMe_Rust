@@ -17,7 +17,7 @@ use crate::{
         resolve_request_url, resolve_request_urls,
     },
     config::AppConfig,
-    content::snapshot_fingerprint,
+    content::{media_identity, snapshot_fingerprint},
     digest::{collection_digest, count_by},
     error::ApiError,
     models::{
@@ -36,7 +36,10 @@ mod collection;
 mod media;
 
 pub(crate) use collection::{build_json_export, build_markdown_export, matches_filter, sort_items};
-use media::{is_local_media_url, media_file, refresh_cover, schedule_media_cache};
+use media::{
+    ensure_archive, is_local_media_url, media_file, recapture_archive, refresh_cover,
+    schedule_media_cache,
+};
 
 #[derive(Default, serde::Deserialize)]
 struct RefreshQuery {
@@ -54,6 +57,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/items/{id}/reanalyze", post(reanalyze_item))
         .route("/api/items/{id}/refresh", post(refresh_item_content))
         .route("/api/items/{id}/cover/refresh", post(refresh_cover))
+        .route("/api/items/{id}/archive", post(recapture_archive))
         .route("/api/links/analyze", post(analyze_link))
         .route("/api/links/analyze-many", post(analyze_links))
         .route("/api/stats", get(stats))
@@ -202,6 +206,7 @@ fn spawn_deferred_analysis(state: AppState, item_id: String, metadata: LinkMetad
             Ok(None) => {}
             Err(error) => tracing::warn!(item_id, %error, "reload for deferred analysis failed"),
         }
+        ensure_archive(&state, &item_id).await;
     });
 }
 
@@ -257,10 +262,8 @@ async fn reanalyze_item(
         extraction: current.extraction.clone(),
     };
     let analysis = analyze_with_deepseek_or_fallback(&state, &metadata).await;
-    let mut updated = build_item(metadata, analysis, current.source_app.clone());
-    updated.id = current.id;
-    updated.created_at = current.created_at;
-    updated.status = current.status;
+    let fresh = build_item(metadata, analysis, current.source_app.clone());
+    let updated = merge_reanalyzed_item(current, fresh);
     save_item(&state.store, updated.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -375,19 +378,37 @@ fn analysis_from_item(item: &LinkItem) -> crate::models::LinkAnalysis {
     }
 }
 
+// Re-analysis rebuilds the item from a fresh AI pass, so identity and the
+// classification the user curated by hand have to be carried over explicitly.
+fn merge_reanalyzed_item(current: LinkItem, mut fresh: LinkItem) -> LinkItem {
+    fresh.id = current.id;
+    fresh.archive = current.archive;
+    fresh.created_at = current.created_at;
+    fresh.status = current.status;
+    fresh.user_edited_at = current.user_edited_at;
+    if current.user_edited_at.is_some() {
+        fresh.category = current.category;
+        fresh.keywords = current.keywords;
+        fresh.notes = current.notes;
+    }
+    fresh
+}
+
 fn merge_refreshed_item(current: LinkItem, mut fresh: LinkItem) -> LinkItem {
     for asset in &mut fresh.media {
+        let identity = media_identity(&asset.url);
         if asset.cached_url.is_none()
             && let Some(cached_url) = current
                 .media
                 .iter()
-                .find(|current_asset| current_asset.url == asset.url)
+                .find(|current_asset| media_identity(&current_asset.url) == identity)
                 .and_then(|current_asset| current_asset.cached_url.clone())
         {
             asset.cached_url = Some(cached_url);
         }
     }
     fresh.id = current.id;
+    fresh.archive = current.archive;
     fresh.source_app = current.source_app;
     fresh.created_at = current.created_at;
     fresh.status = current.status;

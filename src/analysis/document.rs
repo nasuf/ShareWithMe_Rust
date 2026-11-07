@@ -18,6 +18,15 @@ pub(super) fn document_from_html(
     document_from_root(root, base_url)
 }
 
+// Parse an article container's HTML captured by the browser renderer.
+pub(super) fn document_from_fragment(
+    html: &str,
+    base_url: &str,
+) -> (OriginalContent, Vec<MediaAsset>) {
+    let fragment = Html::parse_fragment(html);
+    document_from_root(fragment.root_element(), base_url)
+}
+
 // Extract semantic blocks and media from a specific root element. Dedicated
 // adapters (e.g. WeChat `#js_content`) reuse this so lazy-image and block logic
 // stays in one place.
@@ -25,7 +34,7 @@ pub(super) fn document_from_root(
     root: ElementRef<'_>,
     base_url: &str,
 ) -> (OriginalContent, Vec<MediaAsset>) {
-    let selector = Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li,img").ok();
+    let selector = Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li,figcaption,img").ok();
     let mut blocks = Vec::new();
     let mut media = Vec::new();
     let mut text_chars = 0usize;
@@ -65,9 +74,19 @@ pub(super) fn document_from_root(
                 continue;
             }
             text_chars += text.chars().count();
+            let follows_image = blocks
+                .last()
+                .is_some_and(|previous: &ContentBlock| previous.kind == "image");
+            let (kind, level, text) = if name == "p" && is_caption(&element, &text, follows_image) {
+                ("caption", None, strip_caption_marker(&text))
+            } else if name == "p" && is_bold_subheading(&element, &text) {
+                ("heading", Some(3), text)
+            } else {
+                (block_kind(name), heading_level(name), text)
+            };
             blocks.push(ContentBlock {
-                kind: block_kind(name).to_string(),
-                level: heading_level(name),
+                kind: kind.to_string(),
+                level,
                 text,
                 ..ContentBlock::default()
             });
@@ -182,8 +201,78 @@ fn block_kind(name: &str) -> &'static str {
         "blockquote" => "quote",
         "pre" => "code",
         "li" => "list-item",
+        "figcaption" => "caption",
         _ => "paragraph",
     }
+}
+
+const CAPTION_MARKERS: &[char] = &['△', '▲', '▼', '↑'];
+const MAX_CAPTION_CHARS: usize = 60;
+const MAX_SUBHEADING_CHARS: usize = 40;
+
+// Image captions: an explicit caption class, the "△…" convention used by
+// Chinese news sites, or a short unpunctuated line right after an image.
+fn is_caption(element: &ElementRef<'_>, text: &str, follows_image: bool) -> bool {
+    let chars = text.chars().count();
+    if chars > MAX_CAPTION_CHARS {
+        return false;
+    }
+    let class = element.value().attr("class").unwrap_or_default();
+    if class.contains("caption") || text.starts_with(CAPTION_MARKERS) {
+        return true;
+    }
+    follows_image
+        && !is_bold_subheading(element, text)
+        && !text.ends_with(['。', '！', '？', '；', '：', '.', '!', '?', ';', ':'])
+}
+
+fn strip_caption_marker(text: &str) -> String {
+    text.trim_start_matches(CAPTION_MARKERS).trim().to_string()
+}
+
+// Many editors (Toutiao, WeChat) mark section titles as a bold paragraph
+// instead of an <h*> tag.
+fn is_bold_subheading(element: &ElementRef<'_>, text: &str) -> bool {
+    if text.chars().count() > MAX_SUBHEADING_CHARS {
+        return false;
+    }
+    let mut bold_text = String::new();
+    for node in element.descendants() {
+        let Some(child) = ElementRef::wrap(node) else {
+            continue;
+        };
+        if is_bold_element(&child)
+            && !child
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .take_while(|ancestor| ancestor.id() != element.id())
+                .any(|ancestor| is_bold_element(&ancestor))
+        {
+            bold_text.extend(child.text());
+        }
+    }
+    compact(&bold_text) == compact(text)
+}
+
+fn is_bold_element(element: &ElementRef<'_>) -> bool {
+    let value = element.value();
+    if matches!(value.name(), "strong" | "b") {
+        return true;
+    }
+    let style = value
+        .attr("style")
+        .unwrap_or_default()
+        .replace(' ', "")
+        .to_ascii_lowercase();
+    style.contains("font-weight:bold")
+        || style.contains("font-weight:bolder")
+        || style.contains("font-weight:600")
+        || style.contains("font-weight:700")
+        || style.contains("font-weight:800")
+}
+
+fn compact(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn heading_level(name: &str) -> Option<u8> {
@@ -200,7 +289,45 @@ fn duplicate_text(blocks: &[ContentBlock], text: &str) -> bool {
 mod tests {
     use scraper::Html;
 
-    use super::document_from_html;
+    use super::{document_from_fragment, document_from_html};
+
+    #[test]
+    fn rendered_fragment_keeps_lazy_images_captions_and_bold_subheadings() {
+        let html = r#"<article class="syl-page-article">
+            <p><span>自6日开始的美非法移民“围捕战”似乎难以落幕。</span></p>
+            <p><span><strong>催泪瓦斯、震爆弹和橡皮子弹齐发</strong></span></p>
+            <div class="pgc-img"><img src="data:image/gif;base64,R0lGOD" data-src="https://p3-sign.toutiaoimg.com/a.jpeg"></div>
+            <p>伊朗队球员在墨西哥蒂华纳进行赛前训练</p>
+            <p>正文继续，这是一段完整的句子。</p>
+            <div class="pgc-img"><img data-src="https://p3-sign.toutiaoimg.com/b.jpeg"></div>
+            <p>正文紧跟图片但以句号结尾，所以不是图注。</p>
+            <p>△美国白宫边境事务主管霍曼（资料图）</p>
+        </article>"#;
+        let (content, media) = document_from_fragment(html, "https://www.toutiao.com/article/1/");
+        let kinds = content
+            .blocks
+            .iter()
+            .map(|block| block.kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            [
+                "paragraph",
+                "heading",
+                "image",
+                "caption",
+                "paragraph",
+                "image",
+                "paragraph",
+                "caption"
+            ]
+        );
+        assert_eq!(content.blocks[1].level, Some(3));
+        assert_eq!(content.blocks[7].text, "美国白宫边境事务主管霍曼（资料图）");
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].url, "https://p3-sign.toutiaoimg.com/a.jpeg");
+    }
 
     #[test]
     fn preserves_semantic_blocks_and_images() {

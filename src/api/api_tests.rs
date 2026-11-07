@@ -56,6 +56,7 @@ async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
         source_id: None,
         published_at: None,
         extraction: Default::default(),
+        archive: None,
         summary: "旧封面需要重新解析".to_string(),
         category: "测试".to_string(),
         keywords: vec!["封面刷新".to_string()],
@@ -141,6 +142,45 @@ fn content_refresh_preserves_user_edited_classification() {
         updated.media[0].cached_url.as_deref(),
         Some("/media/asset-stable-0.jpg")
     );
+}
+
+#[test]
+fn reanalysis_preserves_user_edited_classification() {
+    let mut current = test_analysis_item("旧摘要", "自动分类", vec!["自动标签"]);
+    current.id = "stable-id".to_string();
+    current.created_at = Utc::now() - chrono::Duration::days(3);
+    current.status = "favorite".to_string();
+    current.category = "我的收藏夹".to_string();
+    current.keywords = vec!["保留标签".to_string()];
+    current.notes = "我的备注".to_string();
+    current.user_edited_at = Some(Utc::now());
+    let created_at = current.created_at;
+
+    let fresh = test_analysis_item("新摘要", "新自动分类", vec!["新自动标签"]);
+    let updated = merge_reanalyzed_item(current, fresh);
+
+    assert_eq!(updated.summary, "新摘要");
+    assert_eq!(updated.id, "stable-id");
+    assert_eq!(updated.status, "favorite");
+    assert_eq!(updated.created_at, created_at);
+    assert_eq!(updated.category, "我的收藏夹");
+    assert_eq!(updated.keywords, ["保留标签"]);
+    assert_eq!(updated.notes, "我的备注");
+    assert!(updated.user_edited_at.is_some());
+}
+
+#[test]
+fn reanalysis_replaces_classification_the_user_never_touched() {
+    let mut current = test_analysis_item("旧摘要", "自动分类", vec!["自动标签"]);
+    current.id = "stable-id".to_string();
+    current.user_edited_at = None;
+
+    let fresh = test_analysis_item("新摘要", "新自动分类", vec!["新自动标签"]);
+    let updated = merge_reanalyzed_item(current, fresh);
+
+    assert_eq!(updated.category, "新自动分类");
+    assert_eq!(updated.keywords, ["新自动标签"]);
+    assert!(updated.user_edited_at.is_none());
 }
 
 #[test]

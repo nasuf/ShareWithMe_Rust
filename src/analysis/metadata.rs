@@ -557,12 +557,45 @@ pub(super) fn merge_rendered_metadata(metadata: &mut LinkMetadata, rendered: Ren
     {
         metadata.content_text = clean_text(&content_text);
         metadata.original_text = content_text.clone();
-        metadata.original_content = OriginalContent::from_plain_text(content_text);
+        metadata.original_content = OriginalContent::from_plain_text(&content_text);
+        if let Some(html) = rendered
+            .content_html
+            .as_deref()
+            .filter(|html| !html.is_empty())
+        {
+            apply_rendered_document(metadata, html, &content_text);
+        }
     }
     metadata.extraction.method = rendered
         .extractor
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "browser-render".to_string());
+}
+
+// Prefer structured blocks (headings, inline images, captions) parsed from the
+// rendered article HTML, but only when they cover most of the rendered text, so
+// a wrong container never silently drops part of the article.
+fn apply_rendered_document(metadata: &mut LinkMetadata, html: &str, rendered_text: &str) {
+    let (content, media) = super::document::document_from_fragment(html, &metadata.final_url);
+    let rendered_chars = compact_len(rendered_text);
+    let block_chars = compact_len(&content.plain_text);
+    if content.blocks.is_empty() || block_chars * 10 < rendered_chars * 7 {
+        return;
+    }
+    metadata.original_content = content;
+    for asset in media {
+        if !metadata
+            .media
+            .iter()
+            .any(|existing| existing.url == asset.url)
+        {
+            metadata.media.push(asset);
+        }
+    }
+}
+
+fn compact_len(text: &str) -> usize {
+    text.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {

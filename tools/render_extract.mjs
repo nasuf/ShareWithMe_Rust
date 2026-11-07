@@ -1,7 +1,17 @@
 import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
 
+// Usage: node render_extract.mjs <url> [--snapshot <output.jpg>]
+//   --snapshot also writes a JPEG screenshot of the article container so the
+//   backend can keep a visual archive that survives the source going offline.
 const targetUrl = process.argv[2];
+const snapshotFlag = process.argv.indexOf('--snapshot');
+const snapshotPath = snapshotFlag > 0 ? process.argv[snapshotFlag + 1] : '';
+
+const MAX_CONTENT_HTML = 2_000_000;
+// Pixel cap: iOS cannot upload taller textures, and decoding cost grows fast.
+const MAX_SNAPSHOT_HEIGHT = 16000;
+const SNAPSHOT_SCALE = 2;
 
 function cleanText(value, max = 14000) {
   return String(value || '')
@@ -46,12 +56,17 @@ async function extractPage(url) {
       userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
       viewport: { width: 1365, height: 900 },
+      // Archive snapshots render at 2x so text stays sharp on retina phones.
+      deviceScaleFactor: snapshotPath ? SNAPSHOT_SCALE : 1,
       locale: 'zh-CN'
     });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(6000);
+    // Walk the page once so lazy-loaded images swap their placeholder `src`
+    // for the real one (needed for both the HTML blocks and the screenshot).
+    await autoScroll(page);
 
-    return await page.evaluate(() => {
+    const result = await page.evaluate(({ maxContentHtml }) => {
       function clean(value, max = 14000) {
         return String(value || '')
           .replace(/\u00a0/g, ' ')
@@ -91,6 +106,28 @@ async function extractPage(url) {
 
         const articleText = textOf('article') || textOf('.syl-page-article');
         return articleText.length >= 80 ? articleText : candidates[0] || clean(document.body?.innerText || '');
+      }
+
+      // The article container as HTML, so the backend can rebuild headings,
+      // images and captions instead of flattening everything to innerText.
+      function contentHtml() {
+        const selectors = [
+          '#js_content',
+          '.syl-page-article',
+          'article',
+          '.rich_media_content',
+          '.article-content',
+          '[class*=note-content]',
+          'main'
+        ];
+        for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          if (element && clean(element.innerText || '').length >= 80) {
+            const html = element.outerHTML || '';
+            return html.length <= maxContentHtml ? html : '';
+          }
+        }
+        return '';
       }
 
       function jsonLd() {
@@ -140,6 +177,7 @@ async function extractPage(url) {
           author,
           imageUrl: meta('meta[property="og:image"]') || '',
           contentText: clean(body.innerText || ''),
+          contentHtml: contentHtml(),
           extractor: 'wechat-render'
         };
       }
@@ -195,12 +233,124 @@ async function extractPage(url) {
         author: clean(author, 4000),
         imageUrl: image,
         contentText: bestDomText(),
+        contentHtml: contentHtml(),
         extractor: 'browser-render'
       };
-    });
+    }, { maxContentHtml: MAX_CONTENT_HTML });
+
+    if (snapshotPath) {
+      try {
+        result.snapshot = await captureSnapshot(page, snapshotPath);
+      } catch (error) {
+        result.snapshotError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return result;
   } finally {
     await browser.close();
   }
+}
+
+async function autoScroll(page) {
+  await page.evaluate(async () => {
+    const step = Math.max(400, Math.floor(window.innerHeight * 0.8));
+    for (let index = 0; index < 60; index += 1) {
+      const before = window.scrollY;
+      window.scrollBy(0, step);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (window.scrollY === before) break;
+    }
+    window.scrollTo(0, 0);
+  });
+  // Give the images that just entered the viewport a moment to decode.
+  await page
+    .waitForFunction(
+      () => Array.from(document.images).every((image) => image.complete),
+      null,
+      { timeout: 6000 }
+    )
+    .catch(() => {});
+}
+
+// Screenshot the article container (title + body) rather than the whole page,
+// which drops navigation, sidebars and recommendation feeds.
+async function captureSnapshot(page, outputPath) {
+  const measure = () =>
+    page.evaluate(() => {
+      const selectors = [
+        '.article-content',
+        '#img-content',
+        '.note-container',
+        '#js_article',
+        'article',
+        'main'
+      ];
+      for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        if (!element) continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width >= 280 && rect.height >= 300) {
+          return {
+            x: Math.max(0, rect.left + window.scrollX),
+            y: Math.max(0, rect.top + window.scrollY),
+            width: rect.width,
+            height: rect.height
+          };
+        }
+      }
+      return {
+        x: 0,
+        y: 0,
+        width: document.documentElement.clientWidth,
+        height: document.documentElement.scrollHeight
+      };
+    });
+
+  // Fixed/sticky bars would otherwise be painted over the article.
+  await page.evaluate(() => {
+    for (const element of document.querySelectorAll('body *')) {
+      const position = getComputedStyle(element).position;
+      if (position === 'fixed' || position === 'sticky') {
+        element.style.setProperty('display', 'none', 'important');
+      }
+    }
+  });
+
+  // Keep 2x when the whole article fits under the pixel cap; a longer article
+  // drops to 1x so it is still archived in full rather than cut off.
+  const box = await measure();
+  const fullHeight = Math.ceil(box.height);
+  const scale = fullHeight * SNAPSHOT_SCALE <= MAX_SNAPSHOT_HEIGHT ? SNAPSHOT_SCALE : 1;
+  const height = Math.min(fullHeight, Math.floor(MAX_SNAPSHOT_HEIGHT / scale));
+
+  // Size the viewport to the article and scroll to it, instead of `fullPage`:
+  // fullPage resizes to the entire document, which on long pages (tens of
+  // thousands of px) takes longer than the screenshot timeout.
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: viewport.width, height });
+  const settled = await measure();
+  const top = await page.evaluate((y) => {
+    window.scrollTo(0, y);
+    return y - window.scrollY;
+  }, settled.y);
+  await page.waitForTimeout(400);
+
+  const clip = {
+    x: Math.floor(settled.x),
+    y: Math.max(0, Math.floor(top)),
+    width: Math.ceil(settled.width),
+    height
+  };
+  await page.screenshot({
+    path: outputPath,
+    type: 'jpeg',
+    quality: 72,
+    clip,
+    scale: scale === 1 ? 'css' : 'device',
+    timeout: 45000
+  });
+  // Report pixel dimensions: the app sizes the viewer from these.
+  return { path: outputPath, width: clip.width * scale, height: clip.height * scale };
 }
 
 if (!targetUrl) {
@@ -219,7 +369,11 @@ try {
       author: cleanText(result.author, 4000),
       image_url: cleanText(result.imageUrl, 4000),
       content_text: cleanText(result.contentText),
-      extractor: cleanText(result.extractor, 200)
+      content_html: result.contentHtml || '',
+      extractor: cleanText(result.extractor, 200),
+      snapshot_width: result.snapshot?.width ?? null,
+      snapshot_height: result.snapshot?.height ?? null,
+      snapshot_error: result.snapshotError || null
     })
   );
 } catch (error) {

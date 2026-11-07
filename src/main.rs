@@ -501,6 +501,7 @@ mod tests {
             source_id: None,
             published_at: None,
             extraction: Default::default(),
+            archive: None,
             summary: title.to_string(),
             category: "待整理".to_string(),
             keywords: vec![],

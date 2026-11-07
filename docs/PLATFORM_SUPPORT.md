@@ -48,8 +48,30 @@ authorized to access.
    adapter. AI analysis runs only when the content fingerprint changes.
 3. A partial or blocked refresh never replaces a more complete prior snapshot.
 4. User-edited category, keywords, and notes survive automatic refresh.
-5. Up to six source images are converted to bounded JPEG snapshots under
+5. Up to 40 source images are converted to bounded JPEG snapshots under
    `/media`; the remote URL is retained so a later refresh can recover it.
+   Cached files are keyed by the URL without expiring signature params
+   (`x-expires`, `x-signature`, ...), so a re-signed CDN URL reuses the cache.
+6. Browser-rendered pages (Toutiao, WeChat fallback, ...) return the article
+   container HTML as well as its text; it is parsed into the same semantic
+   blocks as plain HTTP pages (inline images, bold-paragraph subheadings,
+   captions) when it covers at least 70% of the rendered text.
+
+## Viewing modes
+
+The app offers three views of a saved item:
+
+| Mode | Source | When it works |
+| --- | --- | --- |
+| Reader (default) | `original_content` blocks + cached media | Always, offline, after the link dies |
+| Original page | Live `final_url` in an in-app WebView | While the source is online |
+| Archive | `archive`: JPEG screenshot of the article container | After the first successful capture |
+
+The archive is captured in the background after save (and on the next refresh
+for older items) by `tools/render_extract.mjs --snapshot`, capped at 16000px
+tall. Blocked/captcha pages are never archived. `POST /api/items/{id}/archive`
+re-captures on demand; each capture gets a new file name because `/media` is
+served as immutable.
 
 ## Production boundary
 

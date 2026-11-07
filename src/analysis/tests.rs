@@ -192,7 +192,11 @@ fn rendered_metadata_replaces_blocked_placeholder() {
                 author: Some("上观新闻".to_string()),
                 image_url: Some("https://example.com/cover.jpg".to_string()),
                 content_text: Some("北京时间6月16日9时，伊朗队将在洛杉矶对阵新西兰队。伊朗队无疑是本届世界杯最受外界关注的球队之一。".to_string()),
+                content_html: None,
                 extractor: Some("browser-render".to_string()),
+                snapshot_width: None,
+                snapshot_height: None,
+                snapshot_error: None,
             },
         );
 
@@ -201,6 +205,87 @@ fn rendered_metadata_replaces_blocked_placeholder() {
     assert!(metadata.content_text.contains("伊朗队"));
     assert!(metadata.original_text.contains("伊朗队"));
     assert!(!metadata.content_text.contains("无法从公开网页直接抓取正文"));
+}
+
+#[test]
+fn rendered_html_restores_inline_images_and_subheadings() {
+    let mut metadata = LinkMetadata {
+        source_url: "https://m.toutiao.com/is/Tq5RwoXBnYM/".to_string(),
+        final_url: "https://www.toutiao.com/article/7513821185688355362/".to_string(),
+        platform: "今日头条".to_string(),
+        ..LinkMetadata::default()
+    };
+    let text = "自6日开始的美非法移民“围捕战”似乎难以落幕。\n\n催泪瓦斯、震爆弹和橡皮子弹齐发\n\n7日，上百名全副武装的联邦机构执法人员与当地社区数百名抗议者对峙后发生冲突。";
+    let html = r#"<article class="syl-page-article"><p>自6日开始的美非法移民“围捕战”似乎难以落幕。</p><p><strong>催泪瓦斯、震爆弹和橡皮子弹齐发</strong></p><div class="pgc-img"><img src="data:image/gif;base64,R0" data-src="https://p3-sign.toutiaoimg.com/inline.jpeg"></div><p>7日，上百名全副武装的联邦机构执法人员与当地社区数百名抗议者对峙后发生冲突。</p></article>"#;
+
+    merge_rendered_metadata(
+        &mut metadata,
+        RenderedPage {
+            ok: true,
+            final_url: Some("https://www.toutiao.com/article/7513821185688355362/".to_string()),
+            title: Some("特朗普下令：解放洛杉矶！".to_string()),
+            description: None,
+            author: None,
+            image_url: None,
+            content_text: Some(text.to_string()),
+            content_html: Some(html.to_string()),
+            extractor: Some("browser-render".to_string()),
+            snapshot_width: None,
+            snapshot_height: None,
+            snapshot_error: None,
+        },
+    );
+
+    let kinds = metadata
+        .original_content
+        .blocks
+        .iter()
+        .map(|block| block.kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["paragraph", "heading", "image", "paragraph"]);
+    assert!(
+        metadata
+            .media
+            .iter()
+            .any(|asset| asset.url == "https://p3-sign.toutiaoimg.com/inline.jpeg")
+    );
+}
+
+#[test]
+fn rendered_html_is_ignored_when_it_misses_most_of_the_text() {
+    let mut metadata = LinkMetadata {
+        final_url: "https://www.toutiao.com/article/1/".to_string(),
+        platform: "今日头条".to_string(),
+        ..LinkMetadata::default()
+    };
+    let text = "第一段正文内容比较长，用来模拟完整的渲染文本。".repeat(10);
+
+    merge_rendered_metadata(
+        &mut metadata,
+        RenderedPage {
+            ok: true,
+            final_url: None,
+            title: None,
+            description: None,
+            author: None,
+            image_url: None,
+            content_text: Some(text.clone()),
+            content_html: Some("<div><p>只有一小段</p></div>".to_string()),
+            extractor: None,
+            snapshot_width: None,
+            snapshot_height: None,
+            snapshot_error: None,
+        },
+    );
+
+    assert!(
+        metadata
+            .original_content
+            .blocks
+            .iter()
+            .all(|block| block.kind == "paragraph")
+    );
+    assert!(metadata.original_content.plain_text.contains("第一段正文"));
 }
 
 #[test]

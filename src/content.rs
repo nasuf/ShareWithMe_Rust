@@ -72,6 +72,19 @@ pub(crate) struct MediaAsset {
     pub(crate) duration_seconds: Option<f64>,
 }
 
+// A visual archive of the source as it looked when saved: a screenshot of the
+// article container stored under `/media`, kept so the item stays viewable in
+// its original layout after the link dies.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct ArchiveSnapshot {
+    pub(crate) kind: String,
+    pub(crate) url: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) source_url: String,
+    pub(crate) captured_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub(crate) struct SourceFact {
     pub(crate) key: String,
@@ -115,6 +128,48 @@ impl ExtractionState {
         self.refresh_after
             .is_none_or(|refresh_after| refresh_after <= now)
     }
+}
+
+// A media URL with expiring signature / tracking query params removed. CDNs
+// such as Toutiao re-sign the same image on every fetch, so the raw URL cannot
+// be used to recognise an image that is already cached.
+pub(crate) fn media_identity(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let kept = parsed
+        .query_pairs()
+        .filter(|(key, _)| !is_volatile_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_fragment(None);
+    if kept.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    parsed.into()
+}
+
+fn is_volatile_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.starts_with("x-")
+        || key.starts_with('_')
+        || key.starts_with("utm_")
+        || matches!(
+            key.as_str(),
+            "expires"
+                | "signature"
+                | "sig"
+                | "sign"
+                | "token"
+                | "auth_key"
+                | "t"
+                | "ts"
+                | "timestamp"
+                | "from"
+                | "lk3s"
+        )
 }
 
 pub(crate) fn content_fingerprint(text: &str) -> String {
@@ -184,6 +239,24 @@ mod tests {
         assert_eq!(
             first,
             snapshot_fingerprint("商品", None, "商品正文", &changed_views)
+        );
+    }
+
+    #[test]
+    fn media_identity_ignores_expiring_signatures_but_keeps_real_params() {
+        let first = "https://p3-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/abc~tplv-tt.jpeg?_iz=58558&from=article.pc_detail&lk3s=953192f4&x-expires=1784516347&x-signature=AAA%3D";
+        let resigned = "https://p3-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/abc~tplv-tt.jpeg?_iz=58558&from=article.pc_detail&lk3s=953192f4&x-expires=1794634071&x-signature=BBB%3D";
+        assert_eq!(
+            super::media_identity(first),
+            super::media_identity(resigned)
+        );
+        assert_eq!(
+            super::media_identity(first),
+            "https://p3-sign.toutiaoimg.com/tos-cn-i-6w9my0ksvp/abc~tplv-tt.jpeg"
+        );
+        assert_ne!(
+            super::media_identity("https://img.example.com/view.php?id=1"),
+            super::media_identity("https://img.example.com/view.php?id=2")
         );
     }
 }
