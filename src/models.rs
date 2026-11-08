@@ -17,6 +17,8 @@ pub(crate) struct ListItemsQuery {
     pub(crate) platform: Option<String>,
     pub(crate) status: Option<String>,
     pub(crate) sort: Option<String>,
+    // "summary" returns card fields only (no article text).
+    pub(crate) fields: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +69,10 @@ pub(crate) struct LinkItem {
     pub(crate) extraction: ExtractionState,
     #[serde(default)]
     pub(crate) archive: Option<ArchiveSnapshot>,
+    // Response-only marker for list rows with article text stripped; never
+    // persisted, so it is skipped unless true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) content_omitted: bool,
     pub(crate) summary: String,
     pub(crate) category: String,
     pub(crate) keywords: Vec<String>,

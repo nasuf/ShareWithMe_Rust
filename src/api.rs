@@ -8,7 +8,10 @@ use axum::{
 };
 use chrono::Utc;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{Any, CorsLayer},
+};
 
 use crate::{
     analysis::{
@@ -81,6 +84,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        // JSON shrinks ~6x; the default predicate leaves JPEG media alone.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -458,7 +463,22 @@ async fn list_items(
     let mut items = all_items(&state.store).await.map_err(ApiError::internal)?;
     items.retain(|item| matches_filter(item, &query));
     sort_items(&mut items, query.sort.as_deref());
+    if query.fields.as_deref() == Some("summary") {
+        items = items.into_iter().map(summary_item).collect();
+    }
     Ok(Json(items))
+}
+
+// The library list only needs card fields. Full article text (stored in up to
+// four forms) is ~80% of the payload, so `fields=summary` drops it and clients
+// fetch GET /api/items/{id} when an item is opened. Opt-in, so older app builds
+// that read content from the list keep working.
+fn summary_item(mut item: LinkItem) -> LinkItem {
+    item.content_text.clear();
+    item.original_text.clear();
+    item.original_content = Default::default();
+    item.content_omitted = true;
+    item
 }
 
 async fn get_item(

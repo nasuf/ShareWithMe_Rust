@@ -367,6 +367,7 @@ mod tests {
             platform: None,
             status: Some("favorite".to_string()),
             sort: None,
+            fields: None,
         };
         let active_query = ListItemsQuery {
             query: None,
@@ -374,6 +375,7 @@ mod tests {
             platform: None,
             status: Some("active".to_string()),
             sort: None,
+            fields: None,
         };
         let all_query = ListItemsQuery {
             query: None,
@@ -381,6 +383,7 @@ mod tests {
             platform: None,
             status: Some(String::new()),
             sort: None,
+            fields: None,
         };
         let platform_query = ListItemsQuery {
             query: None,
@@ -388,6 +391,7 @@ mod tests {
             platform: Some("example.com".to_string()),
             status: Some(String::new()),
             sort: None,
+            fields: None,
         };
         let other_platform_query = ListItemsQuery {
             query: None,
@@ -395,6 +399,7 @@ mod tests {
             platform: Some("GitHub".to_string()),
             status: Some(String::new()),
             sort: None,
+            fields: None,
         };
 
         assert!(matches_filter(&item, &favorite_query));
@@ -410,6 +415,7 @@ mod tests {
                 platform: None,
                 status: Some(String::new()),
                 sort: None,
+                fields: None,
             };
             assert!(matches_filter(&item, &query), "term should match: {term}");
         }
@@ -502,6 +508,7 @@ mod tests {
             published_at: None,
             extraction: Default::default(),
             archive: None,
+            content_omitted: false,
             summary: title.to_string(),
             category: "待整理".to_string(),
             keywords: vec![],

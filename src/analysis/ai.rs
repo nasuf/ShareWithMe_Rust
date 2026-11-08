@@ -294,6 +294,7 @@ pub(crate) fn build_item(
         published_at: metadata.published_at,
         extraction: metadata.extraction,
         archive: None,
+        content_omitted: false,
         summary: analysis.summary,
         category: analysis.category,
         keywords: analysis.keywords,

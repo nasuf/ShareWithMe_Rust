@@ -57,6 +57,7 @@ async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
         published_at: None,
         extraction: Default::default(),
         archive: None,
+        content_omitted: false,
         summary: "旧封面需要重新解析".to_string(),
         category: "测试".to_string(),
         keywords: vec!["封面刷新".to_string()],
@@ -300,4 +301,81 @@ fn test_http_client() -> Client {
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn list_items_serves_gzip_and_opt_in_summary_rows() {
+    let item_id = format!("summary-{}", Uuid::new_v4());
+    let store_path = std::env::temp_dir().join(format!("{item_id}.json"));
+    let body_text = "长文正文内容。".repeat(400);
+    let mut item = test_analysis_item("摘要", "阅读", vec!["标签"]);
+    item.id = item_id.clone();
+    item.content_text = body_text.clone();
+    item.original_text = body_text.clone();
+    item.original_content = crate::content::OriginalContent::from_plain_text(&body_text);
+    let store = Arc::new(Store::local_for_tests(store_path.clone(), vec![item]));
+    let state = AppState {
+        store,
+        http: test_http_client(),
+        config: Arc::new(AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            store: StoreConfig::Local {
+                path: store_path.clone(),
+            },
+            media_path: std::env::temp_dir().join(format!("{item_id}-media")),
+            api_token: None,
+            deepseek_api_key: None,
+            deepseek_base_url: "https://api.deepseek.com/chat/completions".to_string(),
+            deepseek_model: "test".to_string(),
+        }),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, build_router(state)).await.unwrap();
+    });
+
+    let (headers, _) = raw_get(addr, "/api/items", true).await;
+    assert!(headers.contains("content-encoding: gzip"), "{headers}");
+
+    let (_, body) = raw_get(addr, "/api/items?fields=summary", false).await;
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rows[0]["content_omitted"], true);
+    assert_eq!(rows[0]["content_text"], "");
+    assert_eq!(rows[0]["original_text"], "");
+    assert!(
+        rows[0]["original_content"]["blocks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(rows[0]["summary"], "摘要");
+
+    // Without the opt-in, older clients still get the full article.
+    let (_, body) = raw_get(addr, "/api/items", false).await;
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(rows[0].get("content_omitted").is_none());
+    assert_eq!(rows[0]["content_text"], body_text.as_str());
+
+    let _ = std::fs::remove_file(store_path);
+}
+
+async fn raw_get(addr: SocketAddr, path: &str, accept_gzip: bool) -> (String, Vec<u8>) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let encoding = if accept_gzip {
+        "Accept-Encoding: gzip\r\n"
+    } else {
+        ""
+    };
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n{encoding}\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
+    (headers, response[split + 4..].to_vec())
 }
