@@ -3,6 +3,18 @@ use url::Url;
 
 use crate::models::LinkMetadata;
 
+pub(crate) fn is_xiaohongshu_host(host: &str) -> bool {
+    let host = host.trim_start_matches("www.").to_ascii_lowercase();
+    [
+        "xiaohongshu.com",
+        "xhslink.com",
+        "xhslink.cn",
+        "rednote.com",
+    ]
+    .iter()
+    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
 pub(crate) fn platform_for_url(raw_url: &str) -> String {
     let Ok(url) = Url::parse(raw_url) else {
         return "未知来源".to_string();
@@ -12,7 +24,9 @@ pub(crate) fn platform_for_url(raw_url: &str) -> String {
         .unwrap_or_default()
         .trim_start_matches("www.");
     let platform = match host {
-        value if value.contains("xiaohongshu.com") || value.contains("xhslink.com") => "小红书",
+        // xhslink.cn is the newer share short link; rednote.com is the
+        // international domain overseas IPs (e.g. the server) are sent to.
+        value if is_xiaohongshu_host(value) => "小红书",
         value if value.contains("toutiao.com") || value.contains("snssdk.com") => "今日头条",
         value if value.contains("douyin.com") || value.contains("iesdouyin.com") => "抖音",
         value if value.contains("kuaishou.com") || value.contains("gifshow.com") => "快手",

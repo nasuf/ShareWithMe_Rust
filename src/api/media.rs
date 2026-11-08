@@ -166,6 +166,16 @@ fn archivable(item: &LinkItem) -> bool {
             .is_some_and(|url| is_safe_remote_url(&url))
 }
 
+// Xiaohongshu's canonical /explore/{id} URL lacks the share's xsec_token and
+// shows a login wall; the original share link redirects with the token.
+fn archive_source_url(item: &LinkItem) -> &str {
+    if item.platform == "小红书" && !item.source_url.trim().is_empty() {
+        &item.source_url
+    } else {
+        &item.final_url
+    }
+}
+
 async fn capture_archive_file(state: &AppState, item: &LinkItem) -> anyhow::Result<bool> {
     tokio::fs::create_dir_all(&state.config.media_path)
         .await
@@ -179,7 +189,7 @@ async fn capture_archive_file(state: &AppState, item: &LinkItem) -> anyhow::Resu
         captured_at.timestamp()
     );
     let path = state.config.media_path.join(&file_name);
-    let Some(rendered) = render_snapshot(&item.final_url, &path).await else {
+    let Some(rendered) = render_snapshot(archive_source_url(item), &path).await else {
         let _ = tokio::fs::remove_file(&path).await;
         return Ok(false);
     };

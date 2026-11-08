@@ -1,4 +1,5 @@
 use regex::Regex;
+use serde_json::Value;
 use url::Url;
 
 use crate::{
@@ -27,6 +28,12 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
         if metadata.original_text.trim().is_empty() || is_url_only_text(&metadata.original_text) {
             metadata.original_text = reason.to_string();
         }
+        return true;
+    }
+
+    if let Some(note) = note_from_state(html, note_id(&metadata.final_url).as_deref())
+        && apply_state_note(metadata, &note)
+    {
         return true;
     }
 
@@ -83,6 +90,125 @@ pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> boo
         }
     }
     true
+}
+
+// The note object from `window.__INITIAL_STATE__`, in either page shape:
+//   desktop: note.noteDetailMap[<id>].note
+//   mobile:  noteData.data.noteData   (what mobile Safari is served)
+fn note_from_state(html: &str, note_id: Option<&str>) -> Option<Value> {
+    let start = html.find("window.__INITIAL_STATE__")?;
+    let rest = &html[start..];
+    let object_start = rest.find('{')?;
+    let object_end = rest.find("</script>")?;
+    let raw = rest
+        .get(object_start..object_end)?
+        .trim()
+        .trim_end_matches(';');
+    // The state is a JS literal: bare `undefined` values are not valid JSON.
+    let undefined = Regex::new(r"([:\[,])undefined([,\]}])").ok()?;
+    let json = undefined.replace_all(raw, "${1}null${2}");
+    let json = undefined.replace_all(&json, "${1}null${2}");
+    let state: Value = serde_json::from_str(&json).ok()?;
+
+    let has_content = |note: &Value| {
+        ["title", "desc"].iter().any(|key| {
+            note[*key]
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    };
+    if let Some(details) = state["note"]["noteDetailMap"].as_object() {
+        let by_id = note_id
+            .and_then(|id| details.get(id))
+            .map(|detail| &detail["note"]);
+        let note = by_id.filter(|note| has_content(note)).or_else(|| {
+            details
+                .values()
+                .map(|detail| &detail["note"])
+                .find(|note| has_content(note))
+        });
+        if let Some(note) = note {
+            return Some(note.clone());
+        }
+    }
+    let mobile = &state["noteData"]["data"]["noteData"];
+    has_content(mobile).then(|| mobile.clone())
+}
+
+fn apply_state_note(metadata: &mut LinkMetadata, note: &Value) -> bool {
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let title = text(&note["title"]).or_else(|| text(&note["displayTitle"]));
+    let description = text(&note["desc"]);
+    if title.is_none() && description.is_none() {
+        return false;
+    }
+    if let Some(title) = &title {
+        metadata.title = clean_text(title);
+    }
+    if let Some(description) = &description {
+        metadata.description = clean_text(description);
+        metadata.content_text = clean_text(&format!("{}\n\n{description}", metadata.title));
+        metadata.original_text = clean_original_text(description);
+    } else {
+        metadata.content_text = metadata.title.clone();
+        metadata.original_text = metadata.title.clone();
+    }
+    metadata.original_content = OriginalContent::from_plain_text(&metadata.original_text);
+
+    let user = &note["user"];
+    if let Some(author) = text(&user["nickname"]).or_else(|| text(&user["nickName"])) {
+        metadata.author = Some(author);
+    }
+    if metadata.published_at.is_none() {
+        metadata.published_at = note["time"]
+            .as_i64()
+            .and_then(chrono::DateTime::from_timestamp_millis);
+    }
+
+    // Each image lists the sharp picture (`urlDefault`, or `url` on the mobile
+    // page) and a blurry preview (`urlPre`) of the same picture; take one each.
+    let images = note["imageList"]
+        .as_array()
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|image| {
+                    ["urlDefault", "url", "urlPre"]
+                        .iter()
+                        .find_map(|key| text(&image[*key]))
+                        .map(|url| secure_image_url(&url))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(cover) = images.first() {
+        metadata.image_url = Some(cover.clone());
+    }
+    for url in images {
+        if !metadata.media.iter().any(|asset| asset.url == url) {
+            metadata.media.push(MediaAsset {
+                kind: "image".to_string(),
+                url,
+                alt: Some(metadata.title.clone()),
+                ..MediaAsset::default()
+            });
+        }
+    }
+    true
+}
+
+// The mobile page serves xhscdn images over plain http; the CDN supports https.
+fn secure_image_url(url: &str) -> String {
+    match url.strip_prefix("http://") {
+        Some(rest) if rest.contains("xhscdn.com") => format!("https://{rest}"),
+        _ => url.to_string(),
+    }
 }
 
 fn note_section<'a>(html: &'a str, final_url: &str) -> Option<&'a str> {

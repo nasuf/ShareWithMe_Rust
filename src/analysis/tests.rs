@@ -136,6 +136,102 @@ fn extracts_xiaohongshu_note_from_initial_state() {
 }
 
 #[test]
+fn extracts_xiaohongshu_note_from_mobile_page_state() {
+    // Shape served to mobile Safari: noteData.data.noteData, images under
+    // `url`, author under `nickName`, plus a commenter whose `nickname` must
+    // not be mistaken for the author, and JS `undefined` values.
+    let mut metadata = LinkMetadata {
+        source_url: "https://xhslink.cn/o/43YTL1DvUZu".to_string(),
+        final_url:
+            "https://www.xiaohongshu.com/discovery/item/6aa8cb9d000000000b00f876?xsec_token=t"
+                .to_string(),
+        platform: "小红书".to_string(),
+        title: "未命名链接".to_string(),
+        ..LinkMetadata::default()
+    };
+
+    merge_html_metadata(
+        &mut metadata,
+        r#"<script>window.__INITIAL_STATE__={"global":{"x":undefined},"noteData":{"routeQuery":{"noteId":"6aa8cb9d000000000b00f876"},"data":{"noteData":{"noteId":"6aa8cb9d000000000b00f876","type":"normal","desc":"本来囤了几罐打算带去工位分给小伙伴🥱\n倒几颗出来像宝石一样","user":{"nickName":"西塔星球Theta Star","userId":"u1"},"tagList":[{"name":"软糖"}],"time":1789447069000,"title":"拆开瞬间就不想分给同事了🍬✨","imageList":[{"width":1080,"url":"http:\/\/sns-webpic-qc.xhscdn.com\/a\/1","infoList":[{"imageScene":"WB_PRV","url":"http:\/\/sns-webpic-qc.xhscdn.com\/a\/prv"}],"livePhoto":undefined},{"url":"http:\/\/sns-webpic-qc.xhscdn.com\/a\/2"}]},"commentData":{"comments":[{"user":{"nickname":"评论者"},"content":"好吃吗"}]}}}};</script>"#,
+    );
+
+    assert_eq!(metadata.title, "拆开瞬间就不想分给同事了🍬✨");
+    assert_eq!(metadata.author, Some("西塔星球Theta Star".to_string()));
+    assert!(metadata.original_text.contains("倒几颗出来像宝石一样"));
+    assert_eq!(
+        metadata.image_url,
+        Some("https://sns-webpic-qc.xhscdn.com/a/1".to_string())
+    );
+    let image_urls = metadata
+        .media
+        .iter()
+        .map(|asset| asset.url.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        image_urls,
+        [
+            "https://sns-webpic-qc.xhscdn.com/a/1",
+            "https://sns-webpic-qc.xhscdn.com/a/2"
+        ]
+    );
+    assert!(metadata.published_at.is_some());
+}
+
+#[test]
+fn recognizes_new_xiaohongshu_domains() {
+    for url in [
+        "https://xhslink.cn/o/43YTL1DvUZu",
+        "https://www.rednote.com/discovery/item/6aa8cb9d000000000b00f876",
+        "https://xhslink.com/o/abc",
+    ] {
+        assert_eq!(platform_for_url(url), "小红书", "{url}");
+    }
+    assert_eq!(
+        extract_first_url(
+            "拆开瞬间就不想分给同事了🍬✨ 本来囤了几罐打算带去... https://xhslink.cn/o/43YTL1DvUZu 把这段复制好，然后去【小红书】就能看笔记。"
+        ),
+        Some("https://xhslink.cn/o/43YTL1DvUZu".to_string())
+    );
+}
+
+#[test]
+fn recovers_note_url_from_xiaohongshu_login_redirect() {
+    use crate::analysis::metadata::xiaohongshu_login_target;
+
+    let login = "https://www.rednote.com/login?redirectPath=http%3A%2F%2Fwww.rednote.com%2Fdiscovery%2Fitem%2F6af04c1b0000000012009b5a%3Fxsec_token%3DCBnb%3D%26xsec_source%3Dapp_share";
+    assert_eq!(
+        xiaohongshu_login_target(login).as_deref(),
+        Some(
+            "https://www.rednote.com/discovery/item/6af04c1b0000000012009b5a?xsec_token=CBnb=&xsec_source=app_share"
+        )
+    );
+    // Not a login page, or a login redirect that is not a note.
+    assert_eq!(
+        xiaohongshu_login_target("https://www.xiaohongshu.com/explore/6af04c1b0000000012009b5a"),
+        None
+    );
+    assert_eq!(
+        xiaohongshu_login_target(
+            "https://www.xiaohongshu.com/login?redirectPath=https%3A%2F%2Fevil.example%2Fdiscovery%2Fitem%2F1"
+        ),
+        None
+    );
+}
+
+#[test]
+fn xiaohongshu_login_wall_skips_browser_fallback() {
+    let metadata = LinkMetadata {
+        platform: "小红书".to_string(),
+        extraction: crate::content::ExtractionState {
+            method: "login-wall".to_string(),
+            ..Default::default()
+        },
+        ..LinkMetadata::default()
+    };
+    assert!(!should_try_rendered_extraction(&metadata));
+}
+
+#[test]
 fn xiaohongshu_note_keeps_sharp_image_and_drops_blurry_preview() {
     let mut metadata = LinkMetadata {
         source_url: "https://www.xiaohongshu.com/explore/abc123".to_string(),

@@ -1,6 +1,7 @@
 use chrono::Utc;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use url::Url;
 
 use crate::{
     content::{ExtractionState, MediaAsset, OriginalContent, SourceFact, snapshot_fingerprint},
@@ -14,7 +15,8 @@ use super::adapters::{
 };
 use super::classify::{
     clean_original_text, clean_text, first_meaningful_line, first_non_empty,
-    is_blocked_without_content, is_url_only_text, plain_text_preview, platform_for_url,
+    is_blocked_without_content, is_url_only_text, is_xiaohongshu_host, plain_text_preview,
+    platform_for_url,
 };
 use super::document::document_from_html;
 use super::platform_metadata::{
@@ -67,16 +69,41 @@ pub(crate) async fn extract_metadata_with_video_transcription(
         },
     };
 
-    let mut request = http.get(source_url);
-    if let Some(user_agent) = fetch_user_agent(source_url) {
-        request = request.header("user-agent", user_agent);
-    }
-    match request.send().await {
+    match fetch_page(http, source_url).await {
         Ok(response) => {
             metadata.final_url = response.url().to_string();
             metadata.platform = platform_for_url(&metadata.final_url);
+            // Xiaohongshu sometimes still bounces to its login wall; the note
+            // URL (with its xsec_token) is kept in `redirectPath`. Fetch it
+            // directly and, if that fails too, at least keep the note URL so
+            // the item gets the right identity instead of the login page's.
+            let mut stuck_on_login = false;
+            let response = match xiaohongshu_login_target(&metadata.final_url) {
+                Some(target) => {
+                    metadata.final_url = target.clone();
+                    match fetch_page(http, &target).await {
+                        Ok(retry) if xiaohongshu_login_target(retry.url().as_str()).is_none() => {
+                            metadata.final_url = retry.url().to_string();
+                            retry
+                        }
+                        _ => {
+                            stuck_on_login = true;
+                            response
+                        }
+                    }
+                }
+                None => response,
+            };
+            metadata.platform = platform_for_url(&metadata.final_url);
             let status = response.status();
             match response.text().await {
+                // The login wall is a JS shell with no note data; parsing it
+                // would save "Log in - rednote" as the item. Keep the share text.
+                Ok(_) if stuck_on_login => {
+                    let reason = "小红书只返回了登录页面，未取得笔记正文，已保存分享文字。";
+                    metadata.extraction.method = "login-wall".to_string();
+                    metadata.extraction.last_error = Some(reason.to_string());
+                }
                 Ok(html) if status.is_success() => {
                     merge_html_metadata(&mut metadata, &html);
                     enrich_from_html(&mut metadata, &html);
@@ -124,11 +151,47 @@ pub(crate) async fn extract_metadata_with_video_transcription(
 // WeChat serves an "环境异常" verification wall to non-browser user agents.
 // A mobile Safari UA returns the real article HTML (server-rendered `#js_content`
 // or `window.cgiData`), so the direct path can work without a headless browser.
+// Xiaohongshu redirects non-mobile user agents (including our default one) to
+// its login wall, while mobile Safari gets the server-rendered note page.
 fn fetch_user_agent(source_url: &str) -> Option<&'static str> {
-    source_url.contains("mp.weixin.qq.com").then_some(
+    let host = Url::parse(source_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    (source_url.contains("mp.weixin.qq.com") || is_xiaohongshu_host(&host)).then_some(
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 \
          (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     )
+}
+
+async fn fetch_page(http: &Client, url: &str) -> reqwest::Result<reqwest::Response> {
+    let mut request = http.get(url);
+    if let Some(user_agent) = fetch_user_agent(url) {
+        request = request.header("user-agent", user_agent);
+    }
+    request.send().await
+}
+
+// `https://www.xiaohongshu.com/login?redirectPath=<note url>` (or the rednote.com
+// equivalent) -> the note URL, when it points at a note.
+pub(super) fn xiaohongshu_login_target(raw_url: &str) -> Option<String> {
+    let url = Url::parse(raw_url).ok()?;
+    if !is_xiaohongshu_host(url.host_str()?) || !url.path().starts_with("/login") {
+        return None;
+    }
+    let target = url
+        .query_pairs()
+        .find(|(key, _)| key == "redirectPath")
+        .map(|(_, value)| value.into_owned())?;
+    let mut target = Url::parse(&target).ok()?;
+    let is_note = target.host_str().is_some_and(is_xiaohongshu_host)
+        && (target.path().starts_with("/discovery/item/")
+            || target.path().starts_with("/explore/"));
+    if !is_note {
+        return None;
+    }
+    let _ = target.set_scheme("https");
+    Some(target.into())
 }
 
 fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
@@ -502,6 +565,11 @@ fn access_block_reason(html: &str, platform: &str) -> Option<String> {
 }
 
 pub(super) fn should_try_rendered_extraction(metadata: &LinkMetadata) -> bool {
+    // A login wall served to a mobile UA is served to the browser too; rendering
+    // it would only replace the share text with the login shell.
+    if metadata.extraction.method == "login-wall" {
+        return false;
+    }
     let text_len = metadata.content_text.chars().count();
     if is_blocked_without_content(metadata) {
         return true;

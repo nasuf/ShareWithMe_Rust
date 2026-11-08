@@ -52,10 +52,16 @@ async function extractPage(url) {
     args: ['--disable-dev-shm-usage']
   });
   try {
+    // Xiaohongshu sends desktop browsers to its login wall but serves the full
+    // note page to mobile Safari, so those hosts render as a phone.
+    const mobile = isXiaohongshuUrl(url);
     const page = await browser.newPage({
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      viewport: { width: 1365, height: 900 },
+      userAgent: mobile
+        ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
+        : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      viewport: mobile ? { width: 430, height: 932 } : { width: 1365, height: 900 },
+      isMobile: mobile,
+      hasTouch: mobile,
       // Archive snapshots render at 2x so text stays sharp on retina phones.
       deviceScaleFactor: snapshotPath ? SNAPSHOT_SCALE : 1,
       locale: 'zh-CN'
@@ -146,11 +152,15 @@ async function extractPage(url) {
       function xhsNoteFromState() {
         const state = window.__INITIAL_STATE__;
         const detailMap = state?.note?.noteDetailMap;
-        if (!detailMap || typeof detailMap !== 'object') return null;
-        for (const detail of Object.values(detailMap)) {
-          const note = detail?.note;
-          if (note && (note.title || note.desc)) return note;
+        if (detailMap && typeof detailMap === 'object') {
+          for (const detail of Object.values(detailMap)) {
+            const note = detail?.note;
+            if (note && (note.title || note.desc)) return note;
+          }
         }
+        // Mobile page shape.
+        const mobileNote = state?.noteData?.data?.noteData;
+        if (mobileNote && (mobileNote.title || mobileNote.desc)) return mobileNote;
         return null;
       }
 
@@ -189,7 +199,8 @@ async function extractPage(url) {
       }
       const xhsNote = xhsNoteFromState();
       if (xhsNote) {
-        const image = xhsNote.imageList?.[0]?.urlDefault || xhsNote.imageList?.[0]?.urlPre || '';
+        const firstImage = xhsNote.imageList?.[0] || {};
+        const image = firstImage.urlDefault || firstImage.url || firstImage.urlPre || '';
         return {
           ok: true,
           finalUrl: location.href,
@@ -238,6 +249,12 @@ async function extractPage(url) {
       };
     }, { maxContentHtml: MAX_CONTENT_HTML });
 
+    // Ended on a login / captcha wall instead of the content: report failure
+    // so the backend neither saves the wall as content nor archives it.
+    if (isWallUrl(page.url())) {
+      return { ok: false, error: `blocked by login/captcha wall: ${page.url()}` };
+    }
+
     if (snapshotPath) {
       try {
         result.snapshot = await captureSnapshot(page, snapshotPath);
@@ -248,6 +265,29 @@ async function extractPage(url) {
     return result;
   } finally {
     await browser.close();
+  }
+}
+
+function isXiaohongshuUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    return ['xiaohongshu.com', 'xhslink.com', 'xhslink.cn', 'rednote.com'].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWallUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      isXiaohongshuUrl(url) &&
+      (parsed.pathname.startsWith('/login') || parsed.pathname.startsWith('/website-login'))
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -373,7 +413,8 @@ try {
       extractor: cleanText(result.extractor, 200),
       snapshot_width: result.snapshot?.width ?? null,
       snapshot_height: result.snapshot?.height ?? null,
-      snapshot_error: result.snapshotError || null
+      snapshot_error: result.snapshotError || null,
+      error: result.error || null
     })
   );
 } catch (error) {

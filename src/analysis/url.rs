@@ -139,7 +139,9 @@ fn is_supported_bare_url_host(host: &str) -> bool {
     let host = host.trim_start_matches("www.").to_ascii_lowercase();
     const HOSTS: &[&str] = &[
         "xhslink.com",
+        "xhslink.cn",
         "xiaohongshu.com",
+        "rednote.com",
         "v.douyin.com",
         "douyin.com",
         "iesdouyin.com",
