@@ -284,7 +284,9 @@ function isWallUrl(url) {
     const parsed = new URL(url);
     return (
       isXiaohongshuUrl(url) &&
-      (parsed.pathname.startsWith('/login') || parsed.pathname.startsWith('/website-login'))
+      (parsed.pathname.startsWith('/login') ||
+        parsed.pathname.startsWith('/website-login') ||
+        parsed.pathname.startsWith('/404'))
     );
   } catch {
     return false;

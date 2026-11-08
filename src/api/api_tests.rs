@@ -379,3 +379,27 @@ async fn raw_get(addr: SocketAddr, path: &str, accept_gzip: bool) -> (String, Ve
     let headers = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
     (headers, response[split + 4..].to_vec())
 }
+
+#[test]
+fn duplicate_merge_keeps_owner_content_and_users_edits() {
+    let mut owner = test_analysis_item("真正的笔记", "零食", vec!["软糖"]);
+    owner.id = "owner".to_string();
+    owner.title = "拆开瞬间就不想分给同事了🍬✨".to_string();
+    let mut duplicate = test_analysis_item("登录页", "我的收藏夹", vec!["要买"]);
+    duplicate.id = "duplicate".to_string();
+    duplicate.title = "Log in - rednote".to_string();
+    duplicate.notes = "我的备注".to_string();
+    duplicate.user_edited_at = Some(Utc::now());
+    duplicate.status = "favorite".to_string();
+    duplicate.created_at = owner.created_at - chrono::Duration::days(1);
+
+    let merged = merge_duplicate_into(owner, &duplicate);
+
+    assert_eq!(merged.id, "owner");
+    assert_eq!(merged.title, "拆开瞬间就不想分给同事了🍬✨");
+    assert_eq!(merged.category, "我的收藏夹");
+    assert_eq!(merged.keywords, ["要买"]);
+    assert_eq!(merged.notes, "我的备注");
+    assert_eq!(merged.status, "favorite");
+    assert_eq!(merged.created_at, duplicate.created_at);
+}

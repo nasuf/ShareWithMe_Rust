@@ -330,11 +330,49 @@ async fn refresh_item_content(
         preserve_last_good_snapshot(current, &metadata)
     };
 
+    // The refresh resolved to a source another item already holds (e.g. a
+    // share link first saved as a login wall, then saved again once fixed).
+    // `final_url` is unique, so saving would fail: fold this duplicate into
+    // the existing item instead and drop it.
+    if let Some(owner) = all_items(&state.store)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|item| item.final_url == updated.final_url && item.id != updated.id)
+    {
+        let merged = merge_duplicate_into(owner, &updated);
+        save_item(&state.store, merged.clone())
+            .await
+            .map_err(ApiError::internal)?;
+        delete_item_by_id(&state.store, &updated.id)
+            .await
+            .map_err(ApiError::internal)?;
+        schedule_media_cache(state, merged.id.clone());
+        return Ok(Json(merged));
+    }
+
     save_item(&state.store, updated.clone())
         .await
         .map_err(ApiError::internal)?;
     schedule_media_cache(state, updated.id.clone());
     Ok(Json(updated))
+}
+
+// Keep the existing item's content and identity, but don't lose what the user
+// curated on the duplicate.
+fn merge_duplicate_into(mut owner: LinkItem, duplicate: &LinkItem) -> LinkItem {
+    if duplicate.user_edited_at.is_some() && owner.user_edited_at.is_none() {
+        owner.category = duplicate.category.clone();
+        owner.keywords = duplicate.keywords.clone();
+        owner.notes = duplicate.notes.clone();
+        owner.user_edited_at = duplicate.user_edited_at;
+    }
+    if owner.status == "active" && duplicate.status != "active" {
+        owner.status = duplicate.status.clone();
+    }
+    owner.created_at = owner.created_at.min(duplicate.created_at);
+    owner.updated_at = Utc::now();
+    owner
 }
 
 fn preserve_existing_transcript(current: &LinkItem, metadata: &mut LinkMetadata) {

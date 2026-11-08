@@ -219,6 +219,19 @@ fn recovers_note_url_from_xiaohongshu_login_redirect() {
 }
 
 #[test]
+fn recognizes_expired_xiaohongshu_share_page() {
+    use crate::analysis::metadata::is_xiaohongshu_dead_end;
+
+    assert!(is_xiaohongshu_dead_end(
+        "https://www.xiaohongshu.com/404/sec_iYPxltRU?source=xhs_sec_server"
+    ));
+    assert!(!is_xiaohongshu_dead_end(
+        "https://www.xiaohongshu.com/explore/6aa8cb9d000000000b00f876"
+    ));
+    assert!(!is_xiaohongshu_dead_end("https://example.com/404/page"));
+}
+
+#[test]
 fn xiaohongshu_login_wall_skips_browser_fallback() {
     let metadata = LinkMetadata {
         platform: "小红书".to_string(),

@@ -104,6 +104,13 @@ pub(crate) async fn extract_metadata_with_video_transcription(
                     metadata.extraction.method = "login-wall".to_string();
                     metadata.extraction.last_error = Some(reason.to_string());
                 }
+                // Expired share token or hidden note: /404/sec_... page.
+                Ok(_) if is_xiaohongshu_dead_end(&metadata.final_url) => {
+                    let reason =
+                        "小红书分享链接已失效或笔记不可见，未取得笔记正文，已保存分享文字。";
+                    metadata.extraction.method = "link-expired".to_string();
+                    metadata.extraction.last_error = Some(reason.to_string());
+                }
                 Ok(html) if status.is_success() => {
                     merge_html_metadata(&mut metadata, &html);
                     enrich_from_html(&mut metadata, &html);
@@ -174,6 +181,12 @@ async fn fetch_page(http: &Client, url: &str) -> reqwest::Result<reqwest::Respon
 
 // `https://www.xiaohongshu.com/login?redirectPath=<note url>` (or the rednote.com
 // equivalent) -> the note URL, when it points at a note.
+pub(super) fn is_xiaohongshu_dead_end(raw_url: &str) -> bool {
+    Url::parse(raw_url).is_ok_and(|url| {
+        url.host_str().is_some_and(is_xiaohongshu_host) && url.path().starts_with("/404")
+    })
+}
+
 pub(super) fn xiaohongshu_login_target(raw_url: &str) -> Option<String> {
     let url = Url::parse(raw_url).ok()?;
     if !is_xiaohongshu_host(url.host_str()?) || !url.path().starts_with("/login") {
@@ -567,7 +580,10 @@ fn access_block_reason(html: &str, platform: &str) -> Option<String> {
 pub(super) fn should_try_rendered_extraction(metadata: &LinkMetadata) -> bool {
     // A login wall served to a mobile UA is served to the browser too; rendering
     // it would only replace the share text with the login shell.
-    if metadata.extraction.method == "login-wall" {
+    if matches!(
+        metadata.extraction.method.as_str(),
+        "login-wall" | "link-expired"
+    ) {
         return false;
     }
     let text_len = metadata.content_text.chars().count();
