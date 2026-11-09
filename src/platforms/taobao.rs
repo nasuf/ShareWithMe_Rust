@@ -24,3 +24,32 @@ pub(super) fn enrich_from_html(metadata: &mut LinkMetadata, json_ld: &[Value]) {
     structured_data::enrich_product(metadata, json_ld);
     structured_data::prefer_description_as_original(metadata);
 }
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::{TMALL_ITEM_PREFIX, enrich_from_html, identity};
+    use crate::{extraction::json_ld_values, models::LinkMetadata};
+
+    #[test]
+    fn product_description_becomes_the_body() {
+        let html = r#"<script type="application/ld+json">{"@type":"Product","name":"保温杯","description":"316 不锈钢，500ml","offers":{"price":"89"}}</script>"#;
+        let mut metadata = LinkMetadata::default();
+        enrich_from_html(&mut metadata, &json_ld_values(html));
+        assert_eq!(metadata.title, "保温杯");
+        assert_eq!(metadata.original_text, "316 不锈钢，500ml");
+    }
+
+    #[test]
+    fn reads_item_id_from_either_query_key() {
+        let url = Url::parse("https://detail.m.tmall.com/item.htm?itemId=42&spm=x").unwrap();
+        assert_eq!(
+            identity(&url, TMALL_ITEM_PREFIX),
+            Some((
+                "42".to_string(),
+                "https://detail.tmall.com/item.htm?id=42".to_string()
+            ))
+        );
+    }
+}

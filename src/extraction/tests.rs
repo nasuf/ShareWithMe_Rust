@@ -645,3 +645,80 @@ fn douban_security_wall_keeps_shared_text() {
     assert!(metadata.original_text.contains("怪物"));
     assert!(metadata.extraction.last_error.is_some());
 }
+
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Serve `body` for every request on a local port.
+async fn spawn_page(status: &'static str, body: String) -> String {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/article")
+}
+
+#[tokio::test]
+async fn pipeline_extracts_a_generic_article_end_to_end() {
+    let paragraph = "这是一段足够长的文章正文，用来验证整条抽取流水线。".repeat(8);
+    let url = spawn_page(
+        "200 OK",
+        format!(
+            r#"<html><head><meta property="og:title" content="流水线测试文章">
+            <meta name="author" content="测试作者"></head>
+            <body><article><p>{paragraph}</p><p>{paragraph}</p></article></body></html>"#
+        ),
+    )
+    .await;
+
+    let metadata =
+        super::extract_metadata(&local_client(), &url, Some("分享 https://x.test")).await;
+
+    assert_eq!(metadata.title, "流水线测试文章");
+    assert_eq!(metadata.author.as_deref(), Some("测试作者"));
+    assert_eq!(metadata.extraction.method, "html");
+    assert_eq!(metadata.extraction.status, "complete");
+    assert_eq!(metadata.extraction.adapter, "generic");
+    assert_eq!(metadata.shared_text, "分享 https://x.test");
+    assert!(metadata.original_text.contains("抽取流水线"));
+}
+
+#[tokio::test]
+async fn pipeline_keeps_share_text_when_the_page_errors() {
+    let url = spawn_page("404 Not Found", "<p>not found</p>".to_string()).await;
+
+    let metadata = super::extract_metadata(
+        &local_client(),
+        &url,
+        Some("朋友推荐的一篇关于城市规划的长文，值得一读"),
+    )
+    .await;
+
+    assert_eq!(metadata.title, "朋友推荐的一篇关于城市规划的长文，值得一读");
+    assert_eq!(
+        metadata.original_text,
+        "朋友推荐的一篇关于城市规划的长文，值得一读"
+    );
+    assert!(metadata.description.contains("HTTP 404"));
+    // Share text alone is never complete for a generic link, so it is retried.
+    assert_eq!(metadata.extraction.status, "partial");
+    assert_eq!(metadata.extraction.completeness, 50);
+}

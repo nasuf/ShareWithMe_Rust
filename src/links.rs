@@ -80,6 +80,7 @@ fn validate_remote_url(url: &Url) -> Result<(), ApiError> {
 }
 
 fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    // Tests serve fixtures from 127.0.0.1; production never allows loopback.
     if cfg!(test) && ip.is_loopback() {
         return true;
     }

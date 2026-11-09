@@ -479,3 +479,246 @@ async fn auto_refresh_leaves_complete_snapshot_untouched() {
 
     let _ = std::fs::remove_file(store_path);
 }
+
+/// Serve the router over a local store holding `items`, protected by `token`.
+async fn spawn_api(items: Vec<LinkItem>, token: Option<&str>) -> (String, std::path::PathBuf) {
+    let id = Uuid::new_v4();
+    let store_path = std::env::temp_dir().join(format!("api-routes-{id}.json"));
+    let state = AppState {
+        store: Arc::new(Store::local_for_tests(store_path.clone(), items)),
+        http: test_http_client(),
+        config: Arc::new(AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            store: StoreConfig::Local {
+                path: store_path.clone(),
+            },
+            media_path: std::env::temp_dir().join(format!("api-routes-{id}-media")),
+            api_token: token.map(str::to_string),
+            deepseek_api_key: None,
+            deepseek_base_url: "https://api.deepseek.com/chat/completions".to_string(),
+            deepseek_model: "test".to_string(),
+        }),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, build_router(state)).await.unwrap();
+    });
+    (format!("http://{addr}"), store_path)
+}
+
+#[tokio::test]
+async fn item_routes_cover_the_full_lifecycle() {
+    let items = vec![
+        crate::models::test_item("keep", "https://example.com/keep", "保留的文章"),
+        crate::models::test_item("drop", "http://192.168.1.1/private", "要删除的文章"),
+    ];
+    let (base, store_path) = spawn_api(items, Some("secret")).await;
+    let http = test_http_client();
+    let api = |method: reqwest::Method, path: &str| {
+        http.request(method, format!("{base}{path}"))
+            .bearer_auth("secret")
+    };
+
+    // Health is public; everything under /api needs the token.
+    let health = http.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    let anonymous = http.get(format!("{base}/api/items")).send().await.unwrap();
+    assert_eq!(anonymous.status(), 401);
+
+    let list: Vec<serde_json::Value> = api(reqwest::Method::GET, "/api/items")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 2);
+    let missing = api(reqwest::Method::GET, "/api/items/nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    let edited: serde_json::Value = api(reqwest::Method::PATCH, "/api/items/keep")
+        .json(
+            &serde_json::json!({"category": "技术", "keywords": ["Rust", "Rust"], "notes": "复读"}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edited["category"], "技术");
+    assert_eq!(edited["notes"], "复读");
+    let empty_category = api(reqwest::Method::PATCH, "/api/items/keep")
+        .json(&serde_json::json!({"category": "  "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_category.status(), 400);
+
+    let status = api(reqwest::Method::PATCH, "/api/items/keep/status")
+        .json(&serde_json::json!({"status": "favorite"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(status.status().is_success());
+    let bad_status = api(reqwest::Method::PATCH, "/api/items/keep/status")
+        .json(&serde_json::json!({"status": "gone"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_status.status(), 400);
+
+    let stats: serde_json::Value = api(reqwest::Method::GET, "/api/stats")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["total"], 2);
+    let digest: serde_json::Value = api(reqwest::Method::GET, "/api/digest")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(digest["total"].as_u64().is_some());
+    let markdown = api(reqwest::Method::GET, "/api/export/markdown")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(markdown.contains("保留的文章"));
+    let export: serde_json::Value = api(reqwest::Method::GET, "/api/export/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(export["item_count"], 2);
+
+    // Re-importing the export merges by URL instead of duplicating; items with
+    // private URLs are rejected.
+    let exported = |id: &str| {
+        export["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let rejected = api(reqwest::Method::POST, "/api/import/json")
+        .json(&serde_json::json!({"schema_version": 1, "items": [exported("drop")]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400);
+    let imported: serde_json::Value = api(reqwest::Method::POST, "/api/import/json")
+        .json(&serde_json::json!({"schema_version": 1, "items": [exported("keep")]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(imported["merged_count"], 1);
+    assert_eq!(imported["total_count"], 2);
+
+    // A private URL is neither analysed nor archived.
+    let analyze = api(reqwest::Method::POST, "/api/links/analyze")
+        .json(&serde_json::json!({"url": "http://192.168.1.1/admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(analyze.status(), 400);
+    let archive = api(reqwest::Method::POST, "/api/items/drop/archive")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), 400);
+
+    let deleted = api(reqwest::Method::DELETE, "/api/items/drop")
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success());
+    let gone = api(reqwest::Method::GET, "/api/items/drop")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404);
+
+    let _ = std::fs::remove_file(store_path);
+}
+
+#[tokio::test]
+async fn analyze_link_saves_a_new_item_and_merges_a_resubmission() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let page_addr = listener.local_addr().unwrap();
+    let paragraph = "一篇用于验证收录接口的文章正文，内容足够长。".repeat(12);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = format!(
+                r#"<html><head><meta property="og:title" content="收录测试文章"></head>
+                <body><article><p>{paragraph}</p><p>{paragraph}</p></article></body></html>"#
+            );
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            });
+        }
+    });
+    let (base, store_path) = spawn_api(Vec::new(), None).await;
+    let http = test_http_client();
+    let page = format!("http://{page_addr}/post");
+    let analyze = |shared_text: &str| {
+        http.post(format!("{base}/api/links/analyze"))
+            .json(&serde_json::json!({"shared_text": format!("{shared_text} {page}")}))
+            .send()
+    };
+
+    let first: serde_json::Value = analyze("推荐一篇文章").await.unwrap().json().await.unwrap();
+    assert_eq!(first["title"], "收录测试文章");
+    assert_eq!(first["extraction"]["status"], "complete");
+    assert!(!first["summary"].as_str().unwrap().is_empty());
+
+    let second: serde_json::Value = analyze("再分享一次").await.unwrap().json().await.unwrap();
+    assert_eq!(
+        second["id"], first["id"],
+        "same URL must not create a duplicate"
+    );
+    let list: Vec<serde_json::Value> = http
+        .get(format!("{base}/api/items"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+
+    let missing_url = http
+        .post(format!("{base}/api/links/analyze"))
+        .json(&serde_json::json!({"shared_text": "没有链接的文字"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_url.status(), 400);
+
+    let _ = std::fs::remove_file(store_path);
+}

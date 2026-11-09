@@ -143,3 +143,121 @@ fn preferred_source_identity(metadata: &LinkMetadata) -> SourceIdentity {
         final_identity
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::finalize;
+    use crate::{content::ExtractionState, models::LinkMetadata};
+
+    fn snapshot(platform: &str, url: &str, method: &str, text: &str) -> LinkMetadata {
+        LinkMetadata {
+            source_url: url.to_string(),
+            final_url: url.to_string(),
+            platform: platform.to_string(),
+            title: "标题".to_string(),
+            original_text: text.to_string(),
+            extraction: ExtractionState {
+                method: method.to_string(),
+                last_error: Some("旧错误".to_string()),
+                ..ExtractionState::default()
+            },
+            ..LinkMetadata::default()
+        }
+    }
+
+    #[test]
+    fn long_articles_are_complete_and_settled() {
+        let now = Utc::now();
+        let mut metadata = snapshot(
+            "微信公众号",
+            "https://mp.weixin.qq.com/s/abc?from=timeline",
+            "wechat-article",
+            &"正文".repeat(80),
+        );
+        metadata.author = Some("作者".to_string());
+        finalize(&mut metadata, now);
+        assert_eq!(metadata.extraction.status, "complete");
+        assert_eq!(metadata.extraction.completeness, 85);
+        assert_eq!(metadata.extraction.adapter, "wechat_oa");
+        assert_eq!(metadata.extraction.last_error, None);
+        assert!(metadata.extraction.refresh_after.unwrap() > now + chrono::Duration::days(365));
+        assert_eq!(metadata.final_url, "https://mp.weixin.qq.com/s/abc");
+        assert_eq!(metadata.source_id.as_deref(), Some("abc"));
+        assert!(metadata.extraction.content_fingerprint.is_some());
+        assert!(
+            metadata
+                .source_facts
+                .iter()
+                .any(|fact| fact.key == "content_kind" && fact.value == "article")
+        );
+    }
+
+    #[test]
+    fn short_platform_posts_with_an_author_are_complete() {
+        let mut metadata = snapshot(
+            "微博",
+            "https://weibo.com/1/AbCd",
+            "platform-api",
+            "一条短微博",
+        );
+        metadata.author = Some("博主".to_string());
+        finalize(&mut metadata, Utc::now());
+        assert_eq!(metadata.extraction.status, "complete");
+
+        // The same text from a generic page is only partial.
+        let mut generic = snapshot("example.com", "https://example.com/a", "html", "一条短文字");
+        generic.author = Some("某人".to_string());
+        finalize(&mut generic, Utc::now());
+        assert_eq!(generic.extraction.status, "partial");
+        assert_eq!(generic.extraction.completeness, 50);
+    }
+
+    #[test]
+    fn verification_pages_are_blocked_and_retried() {
+        let now = Utc::now();
+        let mut metadata = snapshot("今日头条", "https://www.toutiao.com/a", "blocked-page", "");
+        finalize(&mut metadata, now);
+        assert_eq!(metadata.extraction.status, "blocked");
+        assert_eq!(metadata.extraction.completeness, 15);
+        assert_eq!(
+            metadata.extraction.refresh_after,
+            Some(now + chrono::Duration::hours(12))
+        );
+    }
+
+    #[test]
+    fn empty_marketplace_items_explain_how_to_complete_them() {
+        let mut metadata = snapshot("淘宝", "https://item.taobao.com/item.htm?id=1", "html", "");
+        metadata.extraction.last_error = None;
+        finalize(&mut metadata, Utc::now());
+        assert_eq!(metadata.extraction.status, "partial");
+        assert_eq!(metadata.extraction.completeness, 20);
+        assert_eq!(metadata.extraction.method, "metadata-only");
+        assert!(
+            metadata
+                .extraction
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("分享面板")
+        );
+        assert!(
+            metadata
+                .source_facts
+                .iter()
+                .any(|fact| fact.key == "completion_requirement")
+        );
+    }
+
+    #[test]
+    fn cover_image_is_listed_first_in_media() {
+        let mut metadata = snapshot("example.com", "https://example.com/a", "html", "文字");
+        metadata.add_image("https://example.com/inline.jpg");
+        metadata.image_url = Some("https://example.com/cover.jpg".to_string());
+        finalize(&mut metadata, Utc::now());
+        assert_eq!(metadata.media[0].url, "https://example.com/cover.jpg");
+        assert_eq!(metadata.media.len(), 2);
+    }
+}

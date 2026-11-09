@@ -131,3 +131,85 @@ fn select_text(document: &Html, selector: &str) -> Option<String> {
         .map(|text| clean_text(&text))
         .filter(|value| !value.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_generic_page, verification_wall_reason};
+    use crate::{models::LinkMetadata, platforms::Platform};
+
+    fn metadata(platform: &str, shared_text: &str) -> LinkMetadata {
+        LinkMetadata {
+            source_url: "https://example.com/post".to_string(),
+            final_url: "https://example.com/post".to_string(),
+            platform: platform.to_string(),
+            title: "未命名链接".to_string(),
+            shared_text: shared_text.to_string(),
+            ..LinkMetadata::default()
+        }
+    }
+
+    #[test]
+    fn reads_open_graph_and_article_body() {
+        let mut metadata = metadata("example.com", "");
+        let body = "这是一段足够长的正文。".repeat(10);
+        merge_generic_page(
+            &mut metadata,
+            &format!(
+                r#"<html><head><title>Fallback</title>
+                <meta property="og:title" content="真正的标题">
+                <meta name="description" content="摘要">
+                <meta name="author" content="作者">
+                <meta property="og:image" content="https://example.com/cover.jpg"></head>
+                <body><article><h2>小标题</h2><p>{body}</p>
+                <img src="/inline.jpg"></article></body></html>"#
+            ),
+        );
+        assert_eq!(metadata.title, "真正的标题");
+        assert_eq!(metadata.description, "摘要");
+        assert_eq!(metadata.author.as_deref(), Some("作者"));
+        assert_eq!(
+            metadata.image_url.as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
+        assert_eq!(metadata.extraction.method, "html");
+        assert!(metadata.original_content.blocks.len() >= 2);
+        assert!(
+            metadata
+                .media
+                .iter()
+                .any(|asset| asset.url == "https://example.com/inline.jpg")
+        );
+    }
+
+    #[test]
+    fn keeps_meaningful_share_text_over_a_thin_page() {
+        let mut metadata = metadata("example.com", "朋友分享的一段很有信息量的说明文字");
+        metadata.original_text = metadata.shared_text.clone();
+        merge_generic_page(&mut metadata, "<html><body><p>页脚</p></body></html>");
+        assert_eq!(metadata.original_text, "朋友分享的一段很有信息量的说明文字");
+        assert_ne!(metadata.extraction.method, "html");
+    }
+
+    #[test]
+    fn recognises_each_verification_wall() {
+        let cases = [
+            ("<script>byted_acrawler</script>", Platform::Douyin, "抖音"),
+            ("<script>__ac_nonce</script>", Platform::Toutiao, "今日头条"),
+            (
+                "<title>Sina Visitor System</title>",
+                Platform::Weibo,
+                "微博",
+            ),
+            ("<p>环境异常 去验证</p>", Platform::WeChat, "微信公众号"),
+            ("<script>zse-ck</script>", Platform::Zhihu, "知乎"),
+            ("<div class=captcha></div>", Platform::Generic, "目标网页"),
+        ];
+        for (html, platform, expected) in cases {
+            let reason = verification_wall_reason(html, platform).expect(expected);
+            assert!(reason.starts_with(expected), "{reason}");
+        }
+        // WeChat's wording is only a wall on WeChat pages.
+        assert!(verification_wall_reason("<p>环境异常</p>", Platform::Generic).is_none());
+        assert!(verification_wall_reason("<p>正常页面</p>", Platform::Generic).is_none());
+    }
+}
