@@ -740,3 +740,27 @@ fn parse_platform_fixture(url: &str, platform: &str, html: &str) -> LinkItem {
     let analysis = heuristic_analysis(&metadata, "fixture");
     build_item(metadata, analysis, None)
 }
+
+#[test]
+fn douban_security_wall_keeps_shared_text() {
+    use crate::analysis::metadata::sanitize_platform_shell;
+
+    let mut metadata = LinkMetadata {
+        source_url: "https://www.douban.com/doubanapp/dispatch/movie/35524447?dt_dapp=1"
+            .to_string(),
+        final_url:
+            "https://sec.douban.com/c?r=https%3A%2F%2Fmovie.douban.com%2Fsubject%2F35524447%2F"
+                .to_string(),
+        platform: "豆瓣".to_string(),
+        title: "豆瓣".to_string(),
+        shared_text:
+            "推荐一部韩剧《怪物》 https://www.douban.com/doubanapp/dispatch/movie/35524447"
+                .to_string(),
+        ..LinkMetadata::default()
+    };
+    sanitize_platform_shell(&mut metadata);
+    assert_eq!(metadata.title, "豆瓣条目");
+    assert_eq!(metadata.extraction.method, "metadata-only");
+    assert!(metadata.original_text.contains("怪物"));
+    assert!(metadata.extraction.last_error.is_some());
+}

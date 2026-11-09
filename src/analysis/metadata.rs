@@ -207,7 +207,7 @@ pub(super) fn xiaohongshu_login_target(raw_url: &str) -> Option<String> {
     Some(target.into())
 }
 
-fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
+pub(super) fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
     if metadata.extraction.method == "platform-api" || metadata.extraction.method == "yt-dlp" {
         return;
     }
@@ -231,11 +231,19 @@ fn sanitize_platform_shell(metadata: &mut LinkMetadata) {
         {
             Some("Instagram 只返回了登录页面，未取得帖子正文。")
         }
+        // Douban bounces non-browser clients to sec.douban.com; that page's
+        // only content is the site name. Reached only if the API also failed.
+        "豆瓣" if metadata.final_url.contains("sec.douban.com") => {
+            Some("豆瓣返回了安全验证页面，条目接口也未返回内容，已保存分享文字。")
+        }
         _ => None,
     };
     let Some(reason) = reason else {
         return;
     };
+    if metadata.platform == "豆瓣" && metadata.title.trim() == "豆瓣" {
+        metadata.title = "豆瓣条目".to_string();
+    }
 
     let shared_text = metadata.shared_text.trim();
     let title_fallback = (metadata.platform == "抖音"

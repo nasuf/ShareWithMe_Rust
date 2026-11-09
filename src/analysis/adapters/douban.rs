@@ -19,13 +19,7 @@ pub(super) async fn enrich(metadata: &mut LinkMetadata, http: &Client) {
     else {
         return;
     };
-    let kind = if metadata.source_url.contains("book.douban.com") {
-        "book"
-    } else if metadata.source_url.contains("music.douban.com") {
-        "music"
-    } else {
-        "movie"
-    };
+    let kind = subject_kind(&[&metadata.source_url, &metadata.final_url]);
     let url = format!("https://m.douban.com/rexxar/api/v2/{kind}/{id}?ck=&for_mobile=1");
     let Ok(response) = http
         .get(url)
@@ -47,6 +41,23 @@ pub(super) async fn enrich(metadata: &mut LinkMetadata, http: &Client) {
     };
     if merge(metadata, &value) {
         metadata.extraction.method = "platform-api".to_string();
+    }
+}
+
+// The rexxar API is split by subject kind. Web links carry it in the host
+// (book./music.douban.com), App share links in the path
+// (/doubanapp/dispatch/<kind>/<id>). A movie request for a TV series is
+// redirected to the tv endpoint, so "movie" is a safe default.
+fn subject_kind(urls: &[&str]) -> &'static str {
+    let has = |needle: &str| urls.iter().any(|url| url.contains(needle));
+    if has("book.douban.com") || has("/dispatch/book/") {
+        "book"
+    } else if has("music.douban.com") || has("/dispatch/music/") {
+        "music"
+    } else if has("/dispatch/tv/") {
+        "tv"
+    } else {
+        "movie"
     }
 }
 
@@ -157,7 +168,30 @@ fn value_string(value: &Value) -> Option<String> {
 mod tests {
     use crate::models::LinkMetadata;
 
-    use super::merge;
+    use super::{merge, subject_kind};
+
+    #[test]
+    fn picks_api_kind_from_web_and_app_links() {
+        assert_eq!(
+            subject_kind(&["https://www.douban.com/doubanapp/dispatch/book/1?dt_dapp=1"]),
+            "book"
+        );
+        assert_eq!(
+            subject_kind(&["https://www.douban.com/doubanapp/dispatch/tv/2"]),
+            "tv"
+        );
+        assert_eq!(
+            subject_kind(&["https://music.douban.com/subject/3/"]),
+            "music"
+        );
+        assert_eq!(
+            subject_kind(&[
+                "https://www.douban.com/doubanapp/dispatch/movie/35524447?dt_dapp=1",
+                "https://sec.douban.com/c?r=https%3A%2F%2Fmovie.douban.com%2Fsubject%2F35524447%2F"
+            ]),
+            "movie"
+        );
+    }
 
     #[test]
     fn merges_public_subject_payload() {

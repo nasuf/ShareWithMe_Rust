@@ -131,6 +131,39 @@ fn instagram_identity(segments: &[&str]) -> Option<(String, String)> {
 }
 
 fn douban_identity(url: &Url, segments: &[&str]) -> Option<(String, String)> {
+    // Anti-bot wall: https://sec.douban.com/c?r=<encoded original URL>
+    if url.host_str() == Some("sec.douban.com") {
+        let target = query_value(url, &["r"])?;
+        let target = Url::parse(&target).ok()?;
+        if target.host_str() == Some("sec.douban.com") {
+            return None;
+        }
+        let segments = target
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return douban_identity(&target, &segments);
+    }
+    // App share link: https://www.douban.com/doubanapp/dispatch/<kind>/<id>
+    if let ["doubanapp", "dispatch", kind, id, ..] = segments
+        && !id.is_empty()
+        && id.chars().all(|ch| ch.is_ascii_digit())
+    {
+        let host = match *kind {
+            "movie" | "tv" => "movie.douban.com",
+            "book" => "book.douban.com",
+            "music" => "music.douban.com",
+            _ => return None,
+        };
+        return Some((
+            format!("subject:{id}"),
+            format!("https://{host}/subject/{id}/"),
+        ));
+    }
     for kind in ["subject", "review", "note"] {
         if let Some(id) = id_after(segments, &[kind]) {
             let host = url.host_str().unwrap_or("www.douban.com");
@@ -302,6 +335,26 @@ mod tests {
             ),
         ];
 
+        let douban_cases = [
+            (
+                "https://www.douban.com/doubanapp/dispatch/movie/35524447?dt_dapp=1",
+                "https://movie.douban.com/subject/35524447/",
+                "subject:35524447",
+            ),
+            (
+                "https://www.douban.com/doubanapp/dispatch/book/1084336?dt_dapp=1",
+                "https://book.douban.com/subject/1084336/",
+                "subject:1084336",
+            ),
+            (
+                "https://sec.douban.com/c?r=https%3A%2F%2Fmovie.douban.com%2Fsubject%2F35524447%2F%3Fdt_dapp%3D1&_s=abc&a=1",
+                "https://movie.douban.com/subject/35524447/",
+                "subject:35524447",
+            ),
+        ];
+        let cases = cases
+            .into_iter()
+            .chain(douban_cases.map(|(raw, url, id)| (raw, "豆瓣", url, id)));
         for (raw, platform, expected_url, expected_id) in cases {
             let identity = source_identity(raw, platform);
             assert_eq!(identity.canonical_url, expected_url);
