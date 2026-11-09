@@ -17,12 +17,12 @@ use url::Url;
 
 use crate::{
     analysis::{extract_metadata_with_video_transcription, is_safe_remote_url},
-    content::{ArchiveSnapshot, content_fingerprint, media_identity},
+    content::{ArchiveSnapshot, bytes_fingerprint, content_fingerprint, media_identity},
     error::ApiError,
     models::LinkItem,
     render::render_snapshot,
     state::AppState,
-    store::{find_item, save_item, update_item_cover},
+    store::{all_items, find_item, save_item, update_item_cover},
 };
 
 use super::RefreshQuery;
@@ -276,7 +276,7 @@ async fn cache_cover_image(
 ) -> anyhow::Result<String> {
     cache_remote_image(
         state,
-        &format!("cover-{}.jpg", safe_file_id(item_id)),
+        &format!("cover-{}", safe_file_id(item_id)),
         remote_url,
         900,
     )
@@ -319,12 +319,12 @@ pub(super) async fn cache_item_media(state: &AppState, item_id: &str) -> anyhow:
         let remote_url = item.media[index].url.clone();
         // Keyed by URL, not position: a refresh can reorder `media`, and an
         // index-based name would overwrite a file another asset still uses.
-        let file_name = format!(
-            "asset-{}-{}.jpg",
+        let file_stem = format!(
+            "asset-{}-{}",
             safe_file_id(item_id),
             content_fingerprint(&media_identity(&remote_url))
         );
-        match cache_remote_image(state, &file_name, &remote_url, 1200).await {
+        match cache_remote_image(state, &file_stem, &remote_url, 1200).await {
             Ok(local_url) => {
                 item.media[index].cached_url = Some(local_url.clone());
                 if index == 0 || item.image_url.as_deref() == Some(remote_url.as_str()) {
@@ -347,7 +347,7 @@ pub(super) async fn cache_item_media(state: &AppState, item_id: &str) -> anyhow:
 
 async fn cache_remote_image(
     state: &AppState,
-    file_name: &str,
+    file_stem: &str,
     remote_url: &str,
     max_dimension: u32,
 ) -> anyhow::Result<String> {
@@ -365,12 +365,18 @@ async fn cache_remote_image(
     if !response.status().is_success() {
         anyhow::bail!("download cover returned HTTP {}", response.status());
     }
+    if is_hotlink_placeholder(response.headers()) {
+        anyhow::bail!("source CDN returned its hotlink placeholder");
+    }
     let bytes = response.bytes().await.context("read cover bytes")?;
     if bytes.len() > 12 * 1024 * 1024 {
         anyhow::bail!("cover image too large");
     }
 
     let jpeg = compress_image_jpeg(&bytes, max_dimension)?;
+    // `/media` is served as immutable, so a file whose bytes change (a fixed
+    // placeholder, a new cover) must get a new name or clients keep the old one.
+    let file_name = format!("{file_stem}-{}.jpg", &bytes_fingerprint(&jpeg)[..8]);
     tokio::fs::create_dir_all(&state.config.media_path)
         .await
         .with_context(|| {
@@ -379,7 +385,7 @@ async fn cache_remote_image(
                 state.config.media_path.display()
             )
         })?;
-    let path = state.config.media_path.join(file_name);
+    let path = state.config.media_path.join(&file_name);
     tokio::fs::write(&path, jpeg)
         .await
         .with_context(|| format!("write cover {}", path.display()))?;
@@ -433,10 +439,108 @@ fn referer_for_cover(remote_url: &str) -> &'static str {
         "https://item.jd.com/"
     } else if host.contains("alicdn.com") || host.contains("taobao.com") {
         "https://www.taobao.com/"
+    } else if is_wechat_media_host(&host) {
+        // mmbiz.qpic.cn answers a foreign Referer with a 200 "此图片来自微信公众平台
+        // 未经允许不可引用" placeholder instead of the image.
+        "https://mp.weixin.qq.com/"
     } else if host.contains("weread.qq.com") || host.contains("wrimg.com") {
         "https://weread.qq.com/"
     } else {
         "https://www.google.com/"
+    }
+}
+
+fn is_wechat_media_host(host: &str) -> bool {
+    host.ends_with("qpic.cn") || host.ends_with("qlogo.cn") || host == "mp.weixin.qq.com"
+}
+
+fn is_wechat_media_url(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(is_wechat_media_host))
+        .unwrap_or(false)
+}
+
+// Hotlink-protected CDNs answer HTTP 200 with a stand-in image; Tencent marks
+// it with `x-errinfo: banned`. Caching that would hide the real image forever.
+fn is_hotlink_placeholder(headers: &header::HeaderMap) -> bool {
+    headers
+        .get("x-errinfo")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("banned"))
+}
+
+const WECHAT_REPAIR_MARKER: &str = ".repair-wechat-referer-v1";
+
+// One-off: WeChat images cached before the mp.weixin.qq.com Referer was used
+// are the hotlink placeholder. Drop those caches once and download them again.
+pub(crate) async fn repair_wechat_placeholders(state: &AppState) {
+    let marker = state.config.media_path.join(WECHAT_REPAIR_MARKER);
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        return;
+    }
+    let items = match all_items(&state.store).await {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(%error, "wechat media repair: load items failed");
+            return;
+        }
+    };
+    let mut repaired = 0;
+    for mut item in items {
+        let mut stale_files = Vec::new();
+        for asset in &mut item.media {
+            if is_wechat_media_url(&asset.url)
+                && let Some(cached) = asset.cached_url.take()
+            {
+                stale_files.push(cached);
+            }
+        }
+        if let Some(remote) = item
+            .remote_image_url
+            .clone()
+            .filter(|remote| is_wechat_media_url(remote))
+            && item.image_url.as_deref().is_some_and(is_local_media_url)
+        {
+            stale_files.extend(item.image_url.replace(remote));
+        }
+        if stale_files.is_empty() {
+            continue;
+        }
+        let item_id = item.id.clone();
+        item.updated_at = Utc::now();
+        if let Err(error) = save_item(&state.store, item).await {
+            tracing::warn!(item_id, %error, "wechat media repair: save failed");
+            continue;
+        }
+        if let Err(error) = cache_item_media(state, &item_id).await {
+            tracing::warn!(item_id, %error, "wechat media repair: re-cache failed");
+        }
+        remove_unreferenced_media(state, &item_id, stale_files).await;
+        repaired += 1;
+    }
+    tracing::info!(repaired, "wechat media repair finished");
+    if let Err(error) = tokio::fs::write(&marker, b"done\n").await {
+        tracing::warn!(%error, "wechat media repair: write marker failed");
+    }
+}
+
+async fn remove_unreferenced_media(state: &AppState, item_id: &str, files: Vec<String>) {
+    let Ok(Some(item)) = find_item(&state.store, item_id).await else {
+        return;
+    };
+    for local in files {
+        let still_used = item.image_url.as_deref() == Some(local.as_str())
+            || item
+                .media
+                .iter()
+                .any(|asset| asset.cached_url.as_deref() == Some(local.as_str()));
+        if let Some(name) = local
+            .strip_prefix("/media/")
+            .filter(|name| !still_used && !name.contains('/') && !name.starts_with('.'))
+        {
+            let _ = tokio::fs::remove_file(state.config.media_path.join(name)).await;
+        }
     }
 }
 
@@ -448,7 +552,26 @@ fn safe_file_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::referer_for_cover;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{is_hotlink_placeholder, is_wechat_media_url, referer_for_cover};
+
+    #[test]
+    fn wechat_images_use_the_official_account_referer() {
+        let url = "https://mmbiz.qpic.cn/sz_mmbiz_png/abc/640?wx_fmt=png&from=appmsg";
+        assert_eq!(referer_for_cover(url), "https://mp.weixin.qq.com/");
+        assert!(is_wechat_media_url(url));
+        assert!(is_wechat_media_url("https://wx.qlogo.cn/mmhead/abc/0"));
+        assert!(!is_wechat_media_url("https://example.com/qpic.cn.jpg"));
+    }
+
+    #[test]
+    fn rejects_tencent_hotlink_placeholder() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_hotlink_placeholder(&headers));
+        headers.insert("x-errinfo", HeaderValue::from_static("banned"));
+        assert!(is_hotlink_placeholder(&headers));
+    }
 
     #[test]
     fn uses_platform_referers_for_protected_media_hosts() {

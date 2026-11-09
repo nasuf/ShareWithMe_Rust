@@ -105,7 +105,9 @@ async fn force_refresh_cover_recovers_expired_remote_image_from_source_page() {
     );
     assert!(updated.cover_cached_at.is_some());
     assert!(updated.cover_checked_at.is_some());
-    assert!(media_path.join(format!("cover-{item_id}.jpg")).exists());
+    let file_name = image_url.strip_prefix("/media/").unwrap();
+    assert!(file_name.starts_with(&format!("cover-{item_id}-")));
+    assert!(media_path.join(file_name).exists());
 
     let _ = std::fs::remove_file(store_path);
     let _ = std::fs::remove_dir_all(media_path);

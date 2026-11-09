@@ -39,6 +39,7 @@ mod collection;
 mod media;
 
 pub(crate) use collection::{build_json_export, build_markdown_export, matches_filter, sort_items};
+pub(crate) use media::repair_wechat_placeholders;
 use media::{
     ensure_archive, is_local_media_url, media_file, recapture_archive, refresh_cover,
     schedule_media_cache,

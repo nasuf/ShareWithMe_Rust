@@ -52,6 +52,10 @@ authorized to access.
    `/media`; the remote URL is retained so a later refresh can recover it.
    Cached files are keyed by the URL without expiring signature params
    (`x-expires`, `x-signature`, ...), so a re-signed CDN URL reuses the cache.
+   Each download sends the platform's own Referer (WeChat `mmbiz.qpic.cn`
+   needs `https://mp.weixin.qq.com/`); a hotlink placeholder answered with
+   `x-errinfo: banned` is rejected instead of cached. Cached file names end in
+   a hash of the image bytes, because `/media` is served as immutable.
 6. Browser-rendered pages (Toutiao, WeChat fallback, ...) return the article
    container HTML as well as its text; it is parsed into the same semantic
    blocks as plain HTTP pages (inline images, bold-paragraph subheadings,

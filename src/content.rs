@@ -192,9 +192,13 @@ fn is_volatile_query_key(key: &str) -> bool {
 }
 
 pub(crate) fn content_fingerprint(text: &str) -> String {
+    bytes_fingerprint(text.as_bytes())
+}
+
+pub(crate) fn bytes_fingerprint(bytes: &[u8]) -> String {
     // Stable FNV-1a is sufficient for change detection and avoids a crypto dependency.
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in text.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }

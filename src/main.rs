@@ -66,6 +66,9 @@ async fn main() -> Result<()> {
         config: Arc::clone(&config),
     };
 
+    let repair_state = state.clone();
+    tokio::spawn(async move { api::repair_wechat_placeholders(&repair_state).await });
+
     let app = build_router(state);
 
     info!("ShareWithMe backend listening on {}", config.bind_addr);
