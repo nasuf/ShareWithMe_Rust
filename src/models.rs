@@ -207,3 +207,47 @@ pub(crate) struct JsonImportResponse {
     pub(crate) merged_count: usize,
     pub(crate) total_count: usize,
 }
+
+/// A minimal saved item for tests.
+#[cfg(test)]
+pub(crate) fn test_item(id: &str, final_url: &str, title: &str) -> LinkItem {
+    let now = Utc::now();
+    LinkItem {
+        id: id.to_string(),
+        source_url: final_url.to_string(),
+        final_url: final_url.to_string(),
+        source_app: None,
+        platform: crate::platforms::platform_for_url(final_url),
+        title: title.to_string(),
+        description: String::new(),
+        author: None,
+        image_url: None,
+        remote_image_url: None,
+        cover_cached_at: None,
+        cover_checked_at: None,
+        content_text: String::new(),
+        original_text: String::new(),
+        shared_text: String::new(),
+        original_content: Default::default(),
+        media: Vec::new(),
+        source_facts: Vec::new(),
+        source_id: None,
+        published_at: None,
+        extraction: Default::default(),
+        archive: None,
+        content_omitted: false,
+        summary: title.to_string(),
+        category: "待整理".to_string(),
+        keywords: vec![],
+        entities: vec![],
+        sentiment: "neutral".to_string(),
+        content_type: "link".to_string(),
+        importance_score: 50,
+        notes: String::new(),
+        analysis_pending: false,
+        user_edited_at: None,
+        status: "active".to_string(),
+        created_at: now,
+        updated_at: now,
+    }
+}

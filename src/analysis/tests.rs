@@ -68,3 +68,60 @@ fn content_type_follows_url_and_text() {
     );
     assert_eq!(infer_content_type("https://example.com", "短"), "link");
 }
+
+#[test]
+fn infers_categories_for_specialized_sources() {
+    assert_eq!(infer_category("上海咖啡店 地图 导航", "高德地图"), "地点");
+    assert_eq!(infer_category("Rust API 架构设计", "GitHub"), "技术");
+    assert_eq!(infer_category("双十一优惠券 商品下单", "淘宝"), "购物");
+    assert_eq!(infer_category("播客 专辑 音乐", "小宇宙"), "影音娱乐");
+    assert_eq!(infer_category("项目文档 Notion 资料", "Notion"), "文档资料");
+    assert_eq!(infer_category("资料链接 提取码", "百度网盘"), "文档资料");
+}
+
+#[test]
+fn infers_content_types() {
+    assert_eq!(
+        infer_content_type("https://maps.apple.com/?q=park", ""),
+        "place"
+    );
+    assert_eq!(
+        infer_content_type("https://music.163.com/song?id=1", ""),
+        "audio"
+    );
+    assert_eq!(
+        infer_content_type("https://docs.google.com/document/d/1", ""),
+        "document"
+    );
+    assert_eq!(
+        infer_content_type("https://pan.baidu.com/s/abc", "提取码"),
+        "document"
+    );
+    assert_eq!(
+        infer_content_type("https://www.youtube.com/watch?v=1", ""),
+        "video"
+    );
+    assert_eq!(
+        infer_content_type(
+            "https://www.youtube.com/watch?v=1",
+            "Official video with Apple Music and Spotify links"
+        ),
+        "video"
+    );
+    assert_eq!(
+        infer_content_type("https://www.zhihu.com/question/1/answer/2", "回答"),
+        "article"
+    );
+    assert_eq!(
+        infer_content_type("https://weibo.com/123/abc", "微博正文"),
+        "post"
+    );
+    assert_eq!(
+        infer_content_type("https://item.jd.com/1.html", "商品"),
+        "product"
+    );
+    assert_eq!(
+        infer_content_type("https://m.tb.cn/h.abc123?tk=abcd", "淘宝口令"),
+        "product"
+    );
+}

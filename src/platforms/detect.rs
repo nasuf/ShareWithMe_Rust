@@ -140,4 +140,33 @@ mod tests {
         assert_eq!(platform_for_url("https://example.org/a"), "example.org");
         assert_eq!(platform_for_url("not a url"), "未知来源");
     }
+
+    #[test]
+    fn maps_common_platforms() {
+        let cases = [
+            ("https://xhslink.com/a/b", "小红书"),
+            ("https://www.toutiao.com/article/1", "今日头条"),
+            ("https://v.douyin.com/abc", "抖音"),
+            ("https://b23.tv/abc", "哔哩哔哩"),
+            ("https://www.youtube.com/watch?v=abc", "YouTube"),
+            ("https://youtu.be/abc", "YouTube"),
+            ("https://www.zhihu.com/question/1", "知乎"),
+            ("https://zhuanlan.zhihu.com/p/1", "知乎"),
+            ("https://weibo.com/123/abc", "微博"),
+            ("https://weibo.cn/status/abc", "微博"),
+            ("https://maps.apple.com/?q=coffee", "Apple Maps"),
+            ("https://music.163.com/song?id=1", "网易云音乐"),
+            ("https://docs.google.com/document/d/1", "Google Docs/Drive"),
+            ("https://pan.baidu.com/s/abc", "百度网盘"),
+            ("https://m.tb.cn/h.abc123", "淘宝"),
+            ("https://detail.tmall.com/item.htm?id=1", "天猫"),
+            ("https://map.baidu.com/?uid=1", "百度地图"),
+            ("https://weread.qq.com/web/bookDetail/abc", "微信读书"),
+            ("https://x.com/OpenAI/status/1", "X"),
+        ];
+
+        for (url, expected) in cases {
+            assert_eq!(platform_for_url(url), expected);
+        }
+    }
 }

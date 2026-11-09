@@ -250,3 +250,85 @@ fn clean_shared_url(input: &str) -> String {
         })
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_first_url, extract_urls, is_safe_remote_url};
+
+    #[test]
+    fn extracts_http_and_bare_urls_from_shared_text() {
+        assert_eq!(
+            extract_first_url("复制这段内容后打开 https://xhslink.com/a1b2c3。"),
+            Some("https://xhslink.com/a1b2c3".to_string())
+        );
+        assert_eq!(
+            extract_first_url("看这个 www.example.com/path?x=1，挺有用"),
+            Some("https://www.example.com/path?x=1".to_string())
+        );
+        assert_eq!(
+            extract_first_url("98 小红书 xhslink.com/a1B2c3，复制本条信息"),
+            Some("https://xhslink.com/a1B2c3".to_string())
+        );
+        assert_eq!(
+            extract_first_url("2.33 v.douyin.com/iLxyz9/ 复制此链接"),
+            Some("https://v.douyin.com/iLxyz9/".to_string())
+        );
+        assert_eq!(
+            extract_first_url("这个视频不错 b23.tv/BV1234。"),
+            Some("https://b23.tv/BV1234".to_string())
+        );
+        assert_eq!(
+            extract_first_url("淘宝口令 m.tb.cn/h.abc123?tk=abcd CZ0001"),
+            Some("https://m.tb.cn/h.abc123?tk=abcd".to_string())
+        );
+        assert_eq!(
+            extract_first_url("京东分享 3.cn/abc123 复制打开"),
+            Some("https://3.cn/abc123".to_string())
+        );
+        assert_eq!(
+            extract_first_url("X 帖子 t.co/abc123"),
+            Some("https://t.co/abc123".to_string())
+        );
+        assert_eq!(
+            extract_first_url("高德位置 uri.amap.com/marker?position=116,39"),
+            Some("https://uri.amap.com/marker?position=116,39".to_string())
+        );
+        assert_eq!(
+            extract_first_url("资料在 pan.baidu.com/s/abc123 提取码 test"),
+            Some("https://pan.baidu.com/s/abc123".to_string())
+        );
+        assert_eq!(extract_first_url("版本号 abc.def/ghi 不是链接"), None);
+        assert_eq!(
+            extract_urls("合集 xhslink.com/a1 b23.tv/BV1234 再看 www.example.com/a xhslink.com/a1"),
+            [
+                "https://xhslink.com/a1",
+                "https://b23.tv/BV1234",
+                "https://www.example.com/a"
+            ]
+        );
+        assert_eq!(
+            extract_urls("视频 youtu.be/abc123 问答 zhihu.com/question/1 微博 weibo.com/123/abc"),
+            [
+                "https://youtu.be/abc123",
+                "https://zhihu.com/question/1",
+                "https://weibo.com/123/abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_private_and_local_source_urls() {
+        for url in [
+            "http://localhost:8080/private",
+            "http://192.168.1.1/admin",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/private",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_safe_remote_url(&url::Url::parse(url).unwrap()), "{url}");
+        }
+        assert!(is_safe_remote_url(
+            &url::Url::parse("https://www.xiaohongshu.com/explore/abc").unwrap()
+        ));
+    }
+}

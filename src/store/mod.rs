@@ -199,3 +199,85 @@ pub(crate) async fn update_item_cover(
         )
         .await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs, sync::Arc};
+
+    use uuid::Uuid;
+
+    use super::{Store, all_items, import_items, save_item, update_item_metadata};
+    use crate::models::test_item;
+
+    #[tokio::test]
+    async fn store_deduplicates_by_final_url() {
+        let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
+
+        let first = test_item("first-id", "https://example.com/a", "First title");
+        let second = test_item("second-id", "https://example.com/a", "Second title");
+
+        save_item(&store, first).await.expect("save first");
+        save_item(&store, second).await.expect("save second");
+
+        let items = all_items(&store).await.expect("read items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "first-id");
+        assert_eq!(items[0].title, "Second title");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn import_items_merges_existing_final_urls() {
+        let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
+
+        let original = test_item("original-id", "https://example.com/a", "Original");
+        let imported = test_item("imported-id", "https://example.com/a", "Imported");
+
+        save_item(&store, original).await.expect("save original");
+        let (created, merged) = import_items(&store, vec![imported])
+            .await
+            .expect("import items");
+
+        let items = all_items(&store).await.expect("read items");
+        assert_eq!((created, merged), (0, 1));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "original-id");
+        assert_eq!(items[0].title, "Imported");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn updates_user_editable_item_metadata() {
+        let path = env::temp_dir().join(format!("share_with_me_test_{}.json", Uuid::new_v4()));
+        let store = Arc::new(Store::local_for_tests(path.clone(), Vec::new()));
+        let item = test_item("manual-edit", "https://example.com/a", "Original");
+        let original_updated_at = item.updated_at;
+        save_item(&store, item).await.expect("save item");
+
+        let updated = update_item_metadata(
+            &store,
+            "manual-edit",
+            crate::models::UpdateItemRequest {
+                category: Some("旅行".to_string()),
+                keywords: Some(vec!["路线".to_string(), "攻略".to_string()]),
+                notes: Some("周末整理".to_string()),
+            },
+        )
+        .await
+        .expect("update item");
+
+        assert_eq!(updated.category, "旅行");
+        assert_eq!(updated.keywords, ["路线", "攻略"]);
+        assert_eq!(updated.notes, "周末整理");
+        assert!(updated.updated_at >= original_updated_at);
+
+        let persisted = all_items(&store).await.expect("read items");
+        assert_eq!(persisted[0].category, "旅行");
+
+        let _ = fs::remove_file(path);
+    }
+}

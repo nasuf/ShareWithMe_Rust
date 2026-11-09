@@ -152,3 +152,138 @@ pub(crate) fn sort_items(items: &mut [LinkItem], sort: Option<&str>) {
 fn sanitize_markdown_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::{build_json_export, build_markdown_export, matches_filter, sort_items};
+    use crate::models::{ListItemsQuery, test_item};
+
+    #[test]
+    fn item_filter_respects_status_query() {
+        let mut item = test_item("favorite", "https://example.com/favorite", "Favorite");
+        item.status = "favorite".to_string();
+        item.notes = "周末复盘".to_string();
+
+        let favorite_query = ListItemsQuery {
+            query: None,
+            category: None,
+            platform: None,
+            status: Some("favorite".to_string()),
+            sort: None,
+            fields: None,
+        };
+        let active_query = ListItemsQuery {
+            query: None,
+            category: None,
+            platform: None,
+            status: Some("active".to_string()),
+            sort: None,
+            fields: None,
+        };
+        let all_query = ListItemsQuery {
+            query: None,
+            category: None,
+            platform: None,
+            status: Some(String::new()),
+            sort: None,
+            fields: None,
+        };
+        let platform_query = ListItemsQuery {
+            query: None,
+            category: None,
+            platform: Some("example.com".to_string()),
+            status: Some(String::new()),
+            sort: None,
+            fields: None,
+        };
+        let other_platform_query = ListItemsQuery {
+            query: None,
+            category: None,
+            platform: Some("GitHub".to_string()),
+            status: Some(String::new()),
+            sort: None,
+            fields: None,
+        };
+
+        assert!(matches_filter(&item, &favorite_query));
+        assert!(!matches_filter(&item, &active_query));
+        assert!(matches_filter(&item, &all_query));
+        assert!(matches_filter(&item, &platform_query));
+        assert!(!matches_filter(&item, &other_platform_query));
+
+        for term in ["example.com/favorite", "example.com", "周末复盘"] {
+            let query = ListItemsQuery {
+                query: Some(term.to_string()),
+                category: None,
+                platform: None,
+                status: Some(String::new()),
+                sort: None,
+                fields: None,
+            };
+            assert!(matches_filter(&item, &query), "term should match: {term}");
+        }
+    }
+
+    #[test]
+    fn sort_items_supports_recency_and_importance() {
+        let mut low_old = test_item("low-old", "https://example.com/low", "Low");
+        let mut high_new = test_item("high-new", "https://example.com/high", "High");
+        let mut mid = test_item("mid", "https://example.com/mid", "Mid");
+        low_old.importance_score = 20;
+        high_new.importance_score = 90;
+        mid.importance_score = 50;
+        low_old.created_at -= chrono::Duration::minutes(2);
+        mid.created_at -= chrono::Duration::minutes(1);
+
+        let mut items = vec![mid.clone(), low_old.clone(), high_new.clone()];
+        sort_items(&mut items, Some("oldest"));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low-old", "mid", "high-new"]
+        );
+
+        sort_items(&mut items, Some("importance"));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["high-new", "mid", "low-old"]
+        );
+    }
+
+    #[test]
+    fn markdown_export_contains_summary_and_items() {
+        let mut item = test_item("export", "https://example.com/export", "Export Title");
+        item.category = "资料".to_string();
+        item.keywords = vec!["备份".to_string(), "复盘".to_string()];
+        item.notes = "手动备注".to_string();
+
+        let markdown = build_markdown_export(&[item]);
+
+        assert!(markdown.contains("# ShareWithMe Export"));
+        assert!(markdown.contains("Export Title"));
+        assert!(markdown.contains("https://example.com/export"));
+        assert!(markdown.contains("Keywords: 备份, 复盘"));
+        assert!(markdown.contains("Notes: 手动备注"));
+    }
+
+    #[test]
+    fn json_export_preserves_items_and_schema_version() {
+        let mut item = test_item("json-export", "https://example.com/json", "JSON Export");
+        item.category = "资料".to_string();
+        item.keywords = vec!["迁移".to_string()];
+
+        let export = build_json_export(vec![item.clone()]);
+
+        assert_eq!(export.schema_version, 1);
+        assert_eq!(export.item_count, 1);
+        assert_eq!(export.digest.total, 1);
+        assert_eq!(export.items[0].id, "json-export");
+        assert_eq!(export.items[0].keywords, ["迁移"]);
+    }
+}

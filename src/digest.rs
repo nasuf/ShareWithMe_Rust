@@ -150,3 +150,39 @@ fn unique_limited(values: Vec<String>, limit: usize) -> Vec<String> {
     }
     unique
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::collection_digest;
+    use crate::models::test_item;
+
+    #[test]
+    fn digest_summarizes_active_collection() {
+        let mut items = vec![
+            test_item("one", "https://github.com/example/repo", "Rust API 架构"),
+            test_item(
+                "two",
+                "https://github.com/example/other",
+                "Flutter API 示例",
+            ),
+            test_item("three", "https://item.jd.com/1.html", "优惠券 商品"),
+        ];
+        items[0].category = "技术".to_string();
+        items[0].keywords = vec!["Rust".to_string(), "API".to_string()];
+        items[1].category = "技术".to_string();
+        items[1].keywords = vec!["Flutter".to_string(), "API".to_string()];
+        items[2].category = "购物".to_string();
+        items[2].keywords = vec!["优惠".to_string(), "券".to_string()];
+
+        let mut archived = test_item("archived", "https://example.com/old", "Old");
+        archived.status = "archived".to_string();
+        items.push(archived);
+
+        let digest = collection_digest(&items);
+        assert_eq!(digest.total, 3);
+        assert_eq!(digest.recent_items.len(), 3);
+        assert!(digest.focus_summary.contains("技术 2"));
+        assert!(digest.suggestions.iter().any(|item| item.contains("优惠")));
+    }
+}
