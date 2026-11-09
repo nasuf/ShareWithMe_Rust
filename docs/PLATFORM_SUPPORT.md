@@ -56,6 +56,12 @@ authorized to access.
    container HTML as well as its text; it is parsed into the same semantic
    blocks as plain HTTP pages (inline images, bold-paragraph subheadings,
    captions) when it covers at least 70% of the rendered text.
+7. Only incomplete snapshots (partial, blocked, legacy) are refreshed
+   automatically. A complete one (completeness >= 80, including one kept as
+   `stale`) gets a `refresh_after` ten years out, so the saved version is not
+   replaced by a later edit, deletion, block page or redesign of the source.
+   The per-platform interval in the table applies to incomplete items only;
+   the detail page's refresh button (`?force=true`) still re-fetches anything.
 
 ## Viewing modes
 

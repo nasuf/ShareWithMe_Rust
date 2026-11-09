@@ -354,6 +354,7 @@ fn finalize_metadata(metadata: &mut LinkMetadata, fetched_at: chrono::DateTime<U
         if metadata.extraction.method != "blocked-page" {
             metadata.extraction.last_error = None;
         }
+        metadata.extraction.refresh_after = Some(crate::content::settled_refresh_after(fetched_at));
     } else {
         metadata.extraction.status = "partial".to_string();
         metadata.extraction.completeness = if meaningful_text.is_empty() { 20 } else { 50 };

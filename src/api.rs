@@ -287,6 +287,22 @@ async fn refresh_item_content(
         .ok_or_else(|| ApiError::not_found("item not found"))?;
     let now = Utc::now();
     if !query.force.unwrap_or(false) && !current.extraction.is_stale_at(now) {
+        // Complete items saved before refreshes stopped still carry a past
+        // `refresh_after`, which makes the app ask again on every launch.
+        // Push it out once so the app stops asking.
+        if current.extraction.is_settled()
+            && current
+                .extraction
+                .refresh_after
+                .is_none_or(|refresh_after| refresh_after <= now)
+        {
+            let mut settled = current;
+            settled.extraction.refresh_after = Some(crate::content::settled_refresh_after(now));
+            save_item(&state.store, settled.clone())
+                .await
+                .map_err(ApiError::internal)?;
+            return Ok(Json(settled));
+        }
         return Ok(Json(current));
     }
 
@@ -483,7 +499,15 @@ fn preserve_last_good_snapshot(mut current: LinkItem, attempted: &LinkMetadata) 
     }
     current.extraction.status = "stale".to_string();
     current.extraction.fetched_at = attempted.extraction.fetched_at;
-    current.extraction.refresh_after = attempted.extraction.refresh_after;
+    // A kept complete snapshot stays settled; anything else retries on schedule.
+    current.extraction.refresh_after = if current.extraction.is_settled() {
+        attempted
+            .extraction
+            .fetched_at
+            .map(crate::content::settled_refresh_after)
+    } else {
+        attempted.extraction.refresh_after
+    };
     current.extraction.last_error = attempted.extraction.last_error.clone().or_else(|| {
         Some(format!(
             "{} 本次刷新只获得不完整内容，已保留上一次完整快照。",

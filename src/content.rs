@@ -123,10 +123,29 @@ impl Default for ExtractionState {
     }
 }
 
+// Completeness at which a snapshot counts as "complete" (see finalize_metadata).
+pub(crate) const SETTLED_COMPLETENESS: u8 = 80;
+// A complete snapshot is not refreshed automatically: re-fetching it can only
+// replace it with a source that was since edited, deleted, blocked or
+// re-laid-out. Users can still force a refresh from the detail page.
+const SETTLED_REFRESH_DAYS: i64 = 3650;
+
+pub(crate) fn settled_refresh_after(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::days(SETTLED_REFRESH_DAYS)
+}
+
 impl ExtractionState {
+    /// A complete snapshot (also one kept as `stale` after a failed refresh).
+    /// Legacy items are excluded so they still get upgraded.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.status != "legacy" && self.completeness >= SETTLED_COMPLETENESS
+    }
+
     pub(crate) fn is_stale_at(&self, now: DateTime<Utc>) -> bool {
-        self.refresh_after
-            .is_none_or(|refresh_after| refresh_after <= now)
+        !self.is_settled()
+            && self
+                .refresh_after
+                .is_none_or(|refresh_after| refresh_after <= now)
     }
 }
 
@@ -258,5 +277,30 @@ mod tests {
             super::media_identity("https://img.example.com/view.php?id=1"),
             super::media_identity("https://img.example.com/view.php?id=2")
         );
+    }
+}
+
+#[cfg(test)]
+mod settled_tests {
+    use chrono::{Duration, Utc};
+
+    use super::ExtractionState;
+
+    #[test]
+    fn only_incomplete_snapshots_go_stale() {
+        let now = Utc::now();
+        let past = Some(now - Duration::hours(1));
+        let state = |status: &str, completeness: u8| ExtractionState {
+            status: status.to_string(),
+            completeness,
+            refresh_after: past,
+            ..ExtractionState::default()
+        };
+        assert!(!state("complete", 85).is_stale_at(now));
+        // A complete snapshot kept after a failed refresh.
+        assert!(!state("stale", 90).is_stale_at(now));
+        assert!(state("partial", 50).is_stale_at(now));
+        assert!(state("blocked", 40).is_stale_at(now));
+        assert!(state("legacy", 90).is_stale_at(now));
     }
 }

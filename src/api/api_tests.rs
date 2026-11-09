@@ -403,3 +403,64 @@ fn duplicate_merge_keeps_owner_content_and_users_edits() {
     assert_eq!(merged.status, "favorite");
     assert_eq!(merged.created_at, duplicate.created_at);
 }
+
+#[tokio::test]
+async fn auto_refresh_leaves_complete_snapshot_untouched() {
+    let item_id = format!("settled-{}", Uuid::new_v4());
+    let store_path = std::env::temp_dir().join(format!("{item_id}.json"));
+    let now = Utc::now();
+    let mut item = test_analysis_item("完整摘要", "阅读", vec!["标签"]);
+    item.id = item_id.clone();
+    // Unreachable source: any fetch here would degrade the snapshot.
+    item.source_url = "http://127.0.0.1:9/gone".to_string();
+    item.final_url = item.source_url.clone();
+    item.original_text = "已保存的完整正文".to_string();
+    item.extraction = crate::content::ExtractionState {
+        status: "complete".to_string(),
+        adapter: "generic".to_string(),
+        method: "html".to_string(),
+        completeness: 90,
+        fetched_at: Some(now - chrono::Duration::days(30)),
+        refresh_after: Some(now - chrono::Duration::days(1)),
+        content_fingerprint: Some("kept".to_string()),
+        last_error: None,
+    };
+    let store = Arc::new(Store::local_for_tests(store_path.clone(), vec![item]));
+    let state = AppState {
+        store,
+        http: test_http_client(),
+        config: Arc::new(AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            store: StoreConfig::Local {
+                path: store_path.clone(),
+            },
+            media_path: std::env::temp_dir().join(format!("{item_id}-media")),
+            api_token: None,
+            deepseek_api_key: None,
+            deepseek_base_url: "https://api.deepseek.com/chat/completions".to_string(),
+            deepseek_model: "test".to_string(),
+        }),
+    };
+
+    let Json(updated) = refresh_item_content(
+        State(state.clone()),
+        Path(item_id.clone()),
+        Query(RefreshQuery { force: None }),
+    )
+    .await
+    .expect("refresh");
+
+    assert_eq!(updated.original_text, "已保存的完整正文");
+    assert_eq!(updated.extraction.status, "complete");
+    assert_eq!(
+        updated.extraction.content_fingerprint.as_deref(),
+        Some("kept")
+    );
+    // Pushed far out (and saved) so the app stops asking on every launch.
+    let refresh_after = updated.extraction.refresh_after.expect("refresh_after");
+    assert!(refresh_after > now + chrono::Duration::days(365));
+    let saved = find_item(&state.store, &item_id).await.unwrap().unwrap();
+    assert_eq!(saved.extraction.refresh_after, Some(refresh_after));
+
+    let _ = std::fs::remove_file(store_path);
+}
