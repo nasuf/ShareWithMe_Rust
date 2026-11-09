@@ -1,3 +1,5 @@
+//! Optional speech-to-text for videos without captions (OpenAI-compatible API).
+
 use std::{env, path::PathBuf, time::Duration};
 
 use reqwest::{Client, multipart::Form};
@@ -5,7 +7,7 @@ use serde_json::Value;
 use tokio::{fs, process::Command, time::timeout};
 use uuid::Uuid;
 
-use super::super::classify::clean_original_text;
+use crate::text::clean_original_text;
 
 const DEFAULT_MAX_AUDIO_BYTES: u64 = 96 * 1024 * 1024;
 const DEFAULT_MAX_VIDEO_SECONDS: f64 = 7_200.0;

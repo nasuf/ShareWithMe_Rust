@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::Serialize;
 
-use crate::{analysis::extract_metadata, network::safe_redirect_policy};
+use crate::{extraction::extract_metadata, network::safe_redirect_policy};
 
 #[derive(Serialize)]
 struct ProbeResult {

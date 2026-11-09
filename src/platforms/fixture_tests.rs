@@ -1,36 +1,7 @@
-use crate::{models::LinkMetadata, platforms::source_identity};
+//! Cross-platform fixtures: every dedicated platform's page goes through the
+//! same parse step the pipeline uses and keeps its structure.
 
-use super::{
-    adapters::enrich_from_html, classify::platform_for_url, metadata::merge_html_metadata,
-};
-
-#[test]
-fn recognizes_every_supported_target_platform() {
-    let cases = [
-        ("https://www.xiaohongshu.com/explore/abc", "小红书"),
-        ("https://www.youtube.com/watch?v=abc", "YouTube"),
-        ("https://www.toutiao.com/article/123/", "今日头条"),
-        ("https://www.bilibili.com/video/BV1abc", "哔哩哔哩"),
-        ("https://www.zhihu.com/question/1/answer/2", "知乎"),
-        ("https://weibo.com/123/AbCd", "微博"),
-        ("https://www.douyin.com/video/123", "抖音"),
-        ("https://x.com/OpenAI/status/123", "X"),
-        ("https://www.instagram.com/p/ABC/", "Instagram"),
-        ("https://movie.douban.com/subject/1292052/", "豆瓣"),
-        ("https://www.amap.com/place/B001", "高德地图"),
-        ("https://map.baidu.com/?uid=B001", "百度地图"),
-        ("https://item.jd.com/1001.html", "京东"),
-        ("https://item.taobao.com/item.htm?id=1001", "淘宝"),
-        ("https://detail.tmall.com/item.htm?id=1001", "天猫"),
-        ("https://weread.qq.com/web/bookDetail/abc", "微信读书"),
-    ];
-
-    for (url, expected) in cases {
-        assert_eq!(platform_for_url(url), expected, "{url}");
-        let identity = source_identity(url, expected);
-        assert!(!identity.canonical_url.is_empty(), "{url}");
-    }
-}
+use crate::{extraction::parse_page, models::LinkMetadata};
 
 #[test]
 fn preserves_article_and_social_post_structure() {
@@ -51,8 +22,7 @@ fn preserves_article_and_social_post_structure() {
         let html = format!(
             r#"<html><head><meta property="og:title" content="{title}"><meta property="og:description" content="公开摘要"><meta property="og:image" content="https://example.com/{platform}.jpg"></head><body><article><h1>{title}</h1><p>第一段正文，保留段落结构。</p><blockquote>一段引用内容。</blockquote><ul><li>列表项目</li></ul></article></body></html>"#
         );
-        merge_html_metadata(&mut metadata, &html);
-        enrich_from_html(&mut metadata, &html);
+        parse_page(&mut metadata, &html);
 
         assert_eq!(metadata.title, title);
         assert!(
@@ -101,8 +71,7 @@ fn preserves_video_metadata_for_chinese_and_global_sources() {
 
     for (platform, url, html) in cases {
         let mut metadata = fixture_metadata(platform, url);
-        merge_html_metadata(&mut metadata, html);
-        enrich_from_html(&mut metadata, html);
+        parse_page(&mut metadata, html);
         assert_ne!(metadata.title, "未命名链接", "{platform}");
         assert!(!metadata.original_text.trim().is_empty(), "{platform}");
         assert!(metadata.image_url.is_some(), "{platform}");
@@ -131,8 +100,7 @@ fn preserves_knowledge_book_and_review_content() {
 
     for (platform, url, html) in cases {
         let mut metadata = fixture_metadata(platform, url);
-        merge_html_metadata(&mut metadata, html);
-        enrich_from_html(&mut metadata, html);
+        parse_page(&mut metadata, html);
         assert_ne!(metadata.title, "未命名链接", "{platform}");
         assert!(!metadata.original_text.trim().is_empty(), "{platform}");
         assert!(!metadata.source_facts.is_empty(), "{platform}");
@@ -150,8 +118,7 @@ fn preserves_product_fields_for_each_marketplace() {
         let html = format!(
             r#"<script type="application/ld+json">{{"@type":"Product","name":"{platform}降噪耳机","description":"轻量舒适，支持主动降噪。","sku":"1001","brand":{{"name":"Acme"}},"image":"https://example.com/product.jpg","offers":{{"price":"699","priceCurrency":"CNY","availability":"https://schema.org/InStock"}}}}</script>"#
         );
-        merge_html_metadata(&mut metadata, &html);
-        enrich_from_html(&mut metadata, &html);
+        parse_page(&mut metadata, &html);
         assert!(metadata.title.contains("降噪耳机"));
         assert!(metadata.source_facts.iter().any(|fact| fact.key == "price"));
         assert!(metadata.source_facts.iter().any(|fact| fact.key == "brand"));

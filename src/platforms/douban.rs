@@ -1,17 +1,63 @@
+//! 豆瓣 (Douban): movie/TV/book/music subjects via the public rexxar API.
+
 use reqwest::Client;
 use serde_json::Value;
+use url::Url;
 
 use crate::{
-    content::{MediaAsset, OriginalContent, SourceFact},
     models::LinkMetadata,
+    text::{clean_original_text, clean_text},
 };
 
-use super::super::classify::{clean_original_text, clean_text};
+use super::identity::{id_after, path_segments, query_value};
 
-pub(super) async fn enrich(metadata: &mut LinkMetadata, http: &Client) {
-    if metadata.platform != "豆瓣" {
-        return;
+pub(super) fn identity(url: &Url, segments: &[&str]) -> Option<(String, String)> {
+    // Anti-bot wall: https://sec.douban.com/c?r=<encoded original URL>
+    if url.host_str() == Some("sec.douban.com") {
+        let target = Url::parse(&query_value(url, &["r"])?).ok()?;
+        if target.host_str() == Some("sec.douban.com") {
+            return None;
+        }
+        return identity(&target, &path_segments(&target));
     }
+    // App share link: https://www.douban.com/doubanapp/dispatch/<kind>/<id>
+    if let ["doubanapp", "dispatch", kind, id, ..] = segments
+        && !id.is_empty()
+        && id.chars().all(|ch| ch.is_ascii_digit())
+    {
+        let host = match *kind {
+            "movie" | "tv" => "movie.douban.com",
+            "book" => "book.douban.com",
+            "music" => "music.douban.com",
+            _ => return None,
+        };
+        return Some((
+            format!("subject:{id}"),
+            format!("https://{host}/subject/{id}/"),
+        ));
+    }
+    for kind in ["subject", "review", "note"] {
+        if let Some(id) = id_after(segments, &[kind]) {
+            let host = url.host_str().unwrap_or("www.douban.com");
+            return Some((
+                format!("{kind}:{id}"),
+                format!("https://{host}/{kind}/{id}/"),
+            ));
+        }
+    }
+    None
+}
+
+/// Douban bounces non-browser clients to sec.douban.com; that page's only
+/// content is the site name. Reached only if the subject API also failed.
+pub(super) fn shell_reason(final_url: &str) -> Option<&'static str> {
+    final_url
+        .contains("sec.douban.com")
+        .then_some("豆瓣返回了安全验证页面，条目接口也未返回内容，已保存分享文字。")
+}
+
+/// Subject details from `m.douban.com/rexxar/api/v2/<kind>/<id>`.
+pub(super) async fn enrich_remote(metadata: &mut LinkMetadata, http: &Client) {
     let Some(id) = metadata
         .source_id
         .as_deref()
@@ -69,9 +115,7 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
     if let Some(intro) = value.get("intro").and_then(Value::as_str) {
         let intro = clean_original_text(intro);
         metadata.description = clean_text(&intro);
-        metadata.content_text = clean_text(&intro);
-        metadata.original_text = intro.clone();
-        metadata.original_content = OriginalContent::from_plain_text(intro);
+        metadata.set_body(intro);
     }
     if let Some(image) = value
         .get("pic")
@@ -79,17 +123,9 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
         .and_then(Value::as_str)
     {
         metadata.image_url = Some(image.to_string());
-        if !metadata.media.iter().any(|asset| asset.url == image) {
-            metadata.media.push(MediaAsset {
-                kind: "image".to_string(),
-                url: image.to_string(),
-                alt: Some(metadata.title.clone()),
-                ..MediaAsset::default()
-            });
-        }
+        metadata.add_image(image);
     }
-    fact(
-        metadata,
+    metadata.set_fact(
         "rating",
         "豆瓣评分",
         value
@@ -97,14 +133,8 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
             .and_then(|rating| rating.get("value"))
             .and_then(value_string),
     );
-    fact(
-        metadata,
-        "year",
-        "年份",
-        value.get("year").and_then(value_string),
-    );
-    fact(
-        metadata,
+    metadata.set_fact("year", "年份", value.get("year").and_then(value_string));
+    metadata.set_fact(
         "subtitle",
         "条目信息",
         value
@@ -117,7 +147,7 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
         ("actors", "主演"),
         ("author", "作者"),
     ] {
-        fact(metadata, key, label, names(value.get(key)));
+        metadata.set_fact(key, label, names(value.get(key)));
     }
     true
 }
@@ -135,25 +165,6 @@ fn names(value: Option<&Value>) -> Option<String> {
         .collect::<Vec<_>>()
         .join("、");
     (!names.is_empty()).then_some(names)
-}
-
-fn fact(metadata: &mut LinkMetadata, key: &str, label: &str, value: Option<String>) {
-    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
-        return;
-    };
-    if let Some(existing) = metadata
-        .source_facts
-        .iter_mut()
-        .find(|fact| fact.key == key)
-    {
-        existing.value = value;
-        return;
-    }
-    metadata.source_facts.push(SourceFact {
-        key: key.to_string(),
-        label: label.to_string(),
-        value,
-    });
 }
 
 fn value_string(value: &Value) -> Option<String> {

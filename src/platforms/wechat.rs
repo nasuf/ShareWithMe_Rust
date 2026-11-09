@@ -1,19 +1,48 @@
+//! 微信公众号 (WeChat Official Accounts): `mp.weixin.qq.com/s/...` articles.
+
 use chrono::{TimeZone, Utc};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
+use url::Url;
 
 use crate::{
-    content::{ContentBlock, MediaAsset, OriginalContent, SourceFact},
+    content::{ContentBlock, MediaAsset, OriginalContent},
+    extraction::{document_from_root, meta_content},
     models::LinkMetadata,
-};
-
-use super::super::{
-    classify::{
+    text::{
         clean_original_text, clean_text, first_meaningful_line, html_to_formatted_text,
         is_url_only_text, truncate_chars,
     },
-    document::document_from_root,
 };
+
+use super::identity::{id_after, query_value};
+
+/// Image CDN hosts (`mmbiz.qpic.cn`, avatars on `qlogo.cn`).
+pub(crate) fn is_media_host(host: &str) -> bool {
+    host.ends_with("qpic.cn") || host.ends_with("qlogo.cn") || host == "mp.weixin.qq.com"
+}
+
+pub(super) fn identity(url: &Url, segments: &[&str]) -> Option<(String, String)> {
+    // Short form: https://mp.weixin.qq.com/s/<token>
+    if let Some(token) = id_after(segments, &["s"]) {
+        return Some((token.clone(), format!("https://mp.weixin.qq.com/s/{token}")));
+    }
+    // Query form: https://mp.weixin.qq.com/s?__biz=..&mid=..&idx=..&sn=..
+    // `sn` uniquely identifies the article; keep the stable addressing params and
+    // drop volatile tracking (chksm, scene, key, ...).
+    let sn = query_value(url, &["sn"])?;
+    let canonical = match (
+        query_value(url, &["__biz"]),
+        query_value(url, &["mid"]),
+        query_value(url, &["idx"]),
+    ) {
+        (Some(biz), Some(mid), Some(idx)) => {
+            format!("https://mp.weixin.qq.com/s?__biz={biz}&mid={mid}&idx={idx}&sn={sn}")
+        }
+        _ => format!("https://mp.weixin.qq.com/s?sn={sn}"),
+    };
+    Some((sn, canonical))
+}
 
 /// Parse a WeChat Official Account article (`mp.weixin.qq.com/s/...`).
 ///
@@ -26,11 +55,7 @@ use super::super::{
 ///
 /// Returns `true` when the page is recognised (article, picture message, or an
 /// unavailable article), so the generic Open Graph path is skipped.
-pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> bool {
-    if metadata.platform != "微信公众号" && !metadata.final_url.contains("mp.weixin.qq.com") {
-        return false;
-    }
-
+pub(super) fn merge(metadata: &mut LinkMetadata, html: &str) -> bool {
     if let Some(reason) = unavailable_reason(html) {
         apply_reason(metadata, reason);
         return true;
@@ -267,15 +292,8 @@ fn set_published_at(metadata: &mut LinkMetadata, published_at: chrono::DateTime<
 }
 
 fn push_media(metadata: &mut LinkMetadata, asset: MediaAsset) {
-    if !asset.url.starts_with("http") {
-        return;
-    }
-    if !metadata
-        .media
-        .iter()
-        .any(|existing| existing.url == asset.url)
-    {
-        metadata.media.push(asset);
+    if asset.url.starts_with("http") {
+        metadata.add_media(asset);
     }
 }
 
@@ -546,15 +564,7 @@ fn unescape_literal_ws(value: &str) -> String {
 }
 
 fn push_fact(metadata: &mut LinkMetadata, key: &str, label: &str, value: String) {
-    let value = clean_text(&value);
-    if value.is_empty() || metadata.source_facts.iter().any(|fact| fact.key == key) {
-        return;
-    }
-    metadata.source_facts.push(SourceFact {
-        key: key.to_string(),
-        label: label.to_string(),
-        value,
-    });
+    metadata.add_fact_if_absent(key, label, &clean_text(&value));
 }
 
 fn select_one<'a>(document: &'a Html, selector: &str) -> Option<ElementRef<'a>> {
@@ -565,15 +575,6 @@ fn select_text(document: &Html, selector: &str) -> Option<String> {
     let element = select_one(document, selector)?;
     let text = clean_original_text(&element.text().collect::<Vec<_>>().join(" "));
     (!text.is_empty()).then(|| clean_text(&text))
-}
-
-fn meta_content(document: &Html, selector: &str) -> Option<String> {
-    document
-        .select(&Selector::parse(selector).ok()?)
-        .find_map(|node| node.value().attr("content"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 /// Read an Open Graph / meta tag's `content` via regex, so cgiData and OG-only

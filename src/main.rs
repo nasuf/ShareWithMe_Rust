@@ -10,6 +10,8 @@ mod config;
 mod content;
 mod digest;
 mod error;
+mod extraction;
+mod links;
 mod models;
 mod network;
 mod platforms;
@@ -17,6 +19,7 @@ mod probe;
 mod render;
 mod state;
 mod store;
+mod text;
 
 use api::build_router;
 use config::AppConfig;
@@ -84,13 +87,12 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        analysis::{
-            extract_first_url, extract_urls, infer_category, infer_content_type,
-            is_safe_remote_url, platform_for_url,
-        },
+        analysis::{infer_category, infer_content_type},
         api::{build_json_export, build_markdown_export, matches_filter, sort_items},
         digest::collection_digest,
+        links::{extract_first_url, extract_urls, is_safe_remote_url},
         models::{LinkItem, ListItemsQuery},
+        platforms::platform_for_url,
         store::{Store, all_items, import_items, save_item, update_item_metadata},
     };
 

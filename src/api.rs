@@ -14,15 +14,13 @@ use tower_http::{
 };
 
 use crate::{
-    analysis::{
-        analyze_with_deepseek_or_fallback, build_item, check_deepseek, extract_metadata,
-        extract_metadata_with_video_transcription, heuristic_analysis, is_safe_remote_url,
-        resolve_request_url, resolve_request_urls,
-    },
+    analysis::{analyze_with_deepseek_or_fallback, build_item, check_deepseek, heuristic_analysis},
     config::AppConfig,
     content::{media_identity, snapshot_fingerprint},
     digest::{collection_digest, count_by},
     error::ApiError,
+    extraction::{extract_metadata, extract_metadata_with_video_transcription},
+    links::{is_safe_remote_url, resolve_request_url, resolve_request_urls},
     models::{
         AnalyzeLinkRequest, AnalyzerCheckResponse, CollectionDigest, CollectionStats,
         HealthResponse, JsonImportRequest, JsonImportResponse, LinkAnalysis, LinkItem,

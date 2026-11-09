@@ -1,8 +1,8 @@
 use chrono::Utc;
 
 use crate::{
-    analysis::{clean_text, truncate_chars},
     models::{CollectionDigest, CountBucket, DigestItem, LinkItem},
+    text::{clean_text, truncate_chars},
 };
 
 pub(crate) fn count_by(values: impl Iterator<Item = String>) -> Vec<CountBucket> {

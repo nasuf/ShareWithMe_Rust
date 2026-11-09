@@ -1,6 +1,6 @@
 use reqwest::redirect::Policy;
 
-use crate::analysis::is_safe_remote_url;
+use crate::links::is_safe_remote_url;
 
 pub(crate) fn safe_redirect_policy(max_redirects: usize) -> Policy {
     Policy::custom(move |attempt| {

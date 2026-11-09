@@ -16,10 +16,12 @@ use image::{ColorType, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use url::Url;
 
 use crate::{
-    analysis::{extract_metadata_with_video_transcription, is_safe_remote_url},
     content::{ArchiveSnapshot, bytes_fingerprint, content_fingerprint, media_identity},
     error::ApiError,
+    extraction::extract_metadata_with_video_transcription,
+    links::is_safe_remote_url,
     models::LinkItem,
+    platforms::media_referer,
     render::render_snapshot,
     state::AppState,
     store::{all_items, find_item, save_item, update_item_cover},
@@ -411,53 +413,13 @@ fn referer_for_cover(remote_url: &str) -> &'static str {
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
-    if host.contains("xhscdn.com") || host.contains("xiaohongshu.com") {
-        "https://www.xiaohongshu.com/"
-    } else if host.contains("toutiao") || host.contains("byteimg") {
-        "https://www.toutiao.com/"
-    } else if host.contains("hdslb.com") || host.contains("bilibili.com") {
-        "https://www.bilibili.com/"
-    } else if host.contains("douyinpic.com") || host.contains("douyinvod.com") {
-        "https://www.douyin.com/"
-    } else if host.contains("zhimg.com") || host.contains("zhihu.com") {
-        "https://www.zhihu.com/"
-    } else if host.contains("sinaimg.cn") || host.contains("weibo.com") {
-        "https://weibo.com/"
-    } else if host.contains("doubanio.com") || host.contains("douban.com") {
-        "https://www.douban.com/"
-    } else if host.contains("instagram.com") || host.contains("cdninstagram.com") {
-        "https://www.instagram.com/"
-    } else if host.contains("twimg.com") {
-        "https://x.com/"
-    } else if host.contains("ytimg.com") || host.contains("googleusercontent.com") {
-        "https://www.youtube.com/"
-    } else if host.contains("autonavi.com") || host.contains("amap.com") {
-        "https://www.amap.com/"
-    } else if host.contains("bdimg.com") || host.contains("baidu.com") {
-        "https://map.baidu.com/"
-    } else if host.contains("360buyimg.com") || host.contains("jd.com") {
-        "https://item.jd.com/"
-    } else if host.contains("alicdn.com") || host.contains("taobao.com") {
-        "https://www.taobao.com/"
-    } else if is_wechat_media_host(&host) {
-        // mmbiz.qpic.cn answers a foreign Referer with a 200 "此图片来自微信公众平台
-        // 未经允许不可引用" placeholder instead of the image.
-        "https://mp.weixin.qq.com/"
-    } else if host.contains("weread.qq.com") || host.contains("wrimg.com") {
-        "https://weread.qq.com/"
-    } else {
-        "https://www.google.com/"
-    }
-}
-
-fn is_wechat_media_host(host: &str) -> bool {
-    host.ends_with("qpic.cn") || host.ends_with("qlogo.cn") || host == "mp.weixin.qq.com"
+    media_referer(&host)
 }
 
 fn is_wechat_media_url(url: &str) -> bool {
     Url::parse(url)
         .ok()
-        .and_then(|url| url.host_str().map(is_wechat_media_host))
+        .and_then(|url| url.host_str().map(crate::platforms::wechat::is_media_host))
         .unwrap_or(false)
 }
 
@@ -571,21 +533,5 @@ mod tests {
         assert!(!is_hotlink_placeholder(&headers));
         headers.insert("x-errinfo", HeaderValue::from_static("banned"));
         assert!(is_hotlink_placeholder(&headers));
-    }
-
-    #[test]
-    fn uses_platform_referers_for_protected_media_hosts() {
-        assert_eq!(
-            referer_for_cover("https://i0.hdslb.com/bfs/archive/cover.jpg"),
-            "https://www.bilibili.com/"
-        );
-        assert_eq!(
-            referer_for_cover("https://p3-sign.douyinpic.com/tos-cn/cover.jpeg"),
-            "https://www.douyin.com/"
-        );
-        assert_eq!(
-            referer_for_cover("https://img.alicdn.com/bao/uploaded/item.jpg"),
-            "https://www.taobao.com/"
-        );
     }
 }

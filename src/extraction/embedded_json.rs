@@ -1,141 +1,22 @@
+//! Locate and decode JSON embedded in pages: JSON-LD blocks, `<script id=..>`
+//! payloads, `window.__STATE__ = {...}` assignments and JSONP responses.
+
 use regex::Regex;
 
-use super::{
-    classify::{
-        clean_original_text, clean_text, first_meaningful_line, html_to_formatted_text,
-        plain_text_preview, truncate_chars,
-    },
-    platform_metadata::PlatformMetadata,
+use crate::text::{
+    clean_original_text, clean_text, first_meaningful_line, html_to_formatted_text,
+    plain_text_preview, truncate_chars,
 };
 
-pub(super) fn zhihu_answer_id(raw_url: &str) -> Option<String> {
-    Regex::new(r"/answer/(\d+)")
-        .ok()?
-        .captures(raw_url)?
-        .get(1)
-        .map(|matched| matched.as_str().to_string())
-}
+use super::PlatformMetadata;
 
-pub(super) fn weibo_status_id(raw_url: &str) -> Option<String> {
-    Regex::new(r"/(\d{10,})")
-        .ok()?
-        .captures_iter(raw_url)
-        .filter_map(|captures| captures.get(1).map(|matched| matched.as_str().to_string()))
-        .last()
-}
-
-pub(super) fn zhihu_metadata_from_api_value(value: &serde_json::Value) -> Option<PlatformMetadata> {
-    let title = value
-        .get("question")
-        .and_then(|question| question.get("title"))
-        .and_then(json_value_to_clean_string);
-    let description = value
-        .get("excerpt")
-        .and_then(json_value_to_clean_string)
-        .or_else(|| {
-            value
-                .get("content")
-                .and_then(json_value_to_clean_string)
-                .map(|content| truncate_chars(&plain_text_preview(&content), 1_200))
-        });
-    let original_text = value
-        .get("content")
-        .and_then(json_value_to_original_string)
-        .map(|content| truncate_chars(&html_to_formatted_text(&content), 12_000))
-        .or_else(|| value.get("excerpt").and_then(json_value_to_original_string));
-    let author = value
-        .get("author")
-        .and_then(|author| author.get("name"))
-        .and_then(json_value_to_clean_string);
-    let image_url = value
-        .get("thumbnail")
-        .and_then(json_value_to_image_url)
-        .or_else(|| {
-            value
-                .get("author")
-                .and_then(|author| author.get("avatar_url"))
-                .and_then(json_value_to_image_url)
-        });
-    let metadata = PlatformMetadata {
-        title,
-        description,
-        author,
-        image_url,
-        original_text,
-    };
-    metadata.is_meaningful().then_some(metadata)
-}
-
-pub(super) fn weibo_metadata_from_api_value(value: &serde_json::Value) -> Option<PlatformMetadata> {
-    if value.get("error").is_some() {
-        return None;
-    }
-    let description = value
-        .get("text_raw")
-        .and_then(json_value_to_clean_string)
-        .or_else(|| {
-            value
-                .get("text")
-                .and_then(json_value_to_clean_string)
-                .map(|text| plain_text_preview(&text))
-        });
-    let original_text = value
-        .get("text_raw")
-        .and_then(json_value_to_original_string)
-        .or_else(|| {
-            value
-                .get("text")
-                .and_then(json_value_to_original_string)
-                .map(|text| html_to_formatted_text(&text))
-        });
-    let title = description
-        .as_deref()
-        .map(|description| truncate_chars(description, 80));
-    let author = value
-        .get("user")
-        .and_then(|user| user.get("screen_name"))
-        .and_then(json_value_to_clean_string);
-    let image_url = weibo_image_url(value);
-    let metadata = PlatformMetadata {
-        title,
-        description,
-        author,
-        image_url,
-        original_text,
-    };
-    metadata.is_meaningful().then_some(metadata)
-}
-
-fn weibo_image_url(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("pic_infos")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|pics| {
-            pics.values().find_map(|pic| {
-                ["largest", "large", "original", "bmiddle", "thumbnail"]
-                    .iter()
-                    .find_map(|key| {
-                        pic.get(*key)
-                            .and_then(|image| image.get("url"))
-                            .and_then(json_value_to_image_url)
-                    })
-            })
-        })
-        .or_else(|| {
-            value
-                .get("page_info")
-                .and_then(|page| page.get("page_pic"))
-                .and_then(json_value_to_image_url)
-        })
-}
-
-pub(super) fn jsonp_value(input: &str) -> Option<serde_json::Value> {
+pub(crate) fn jsonp_value(input: &str) -> Option<serde_json::Value> {
     let start = input.find('{')?;
     let json = balanced_json_from(input, start)?;
     serde_json::from_str(&json).ok()
 }
 
-pub(super) fn platform_metadata_from_values(
+pub(crate) fn platform_metadata_from_values(
     values: Vec<serde_json::Value>,
     title_keys: &[&str],
     description_keys: &[&str],
@@ -185,14 +66,14 @@ pub(super) fn platform_metadata_from_values(
     }
 }
 
-pub(super) fn json_ld_values(html: &str) -> Vec<serde_json::Value> {
+pub(crate) fn json_ld_values(html: &str) -> Vec<serde_json::Value> {
     script_bodies_by_attr(html, "type", "application/ld+json")
         .into_iter()
         .flat_map(|body| parse_json_values(&body))
         .collect()
 }
 
-pub(super) fn json_values_from_script_id(html: &str, id: &str) -> Vec<serde_json::Value> {
+pub(crate) fn json_values_from_script_id(html: &str, id: &str) -> Vec<serde_json::Value> {
     script_bodies_by_attr(html, "id", id)
         .into_iter()
         .flat_map(|body| {
@@ -202,7 +83,7 @@ pub(super) fn json_values_from_script_id(html: &str, id: &str) -> Vec<serde_json
         .collect()
 }
 
-pub(super) fn json_values_after_markers(html: &str, markers: &[&str]) -> Vec<serde_json::Value> {
+pub(crate) fn json_values_after_markers(html: &str, markers: &[&str]) -> Vec<serde_json::Value> {
     markers
         .iter()
         .filter_map(|marker| balanced_json_after_marker(html, marker))
@@ -377,7 +258,7 @@ fn find_image_by_key(value: &serde_json::Value, key: &str) -> Option<String> {
     }
 }
 
-fn json_value_to_image_url(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_value_to_image_url(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) => normalize_image_url(value),
         serde_json::Value::Array(values) => values.iter().find_map(json_value_to_image_url),
@@ -400,7 +281,7 @@ fn normalize_image_url(value: &str) -> Option<String> {
     None
 }
 
-fn json_value_to_clean_string(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_value_to_clean_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) => Some(clean_text(value)),
         serde_json::Value::Number(value) => Some(value.to_string()),
@@ -413,7 +294,7 @@ fn json_value_to_clean_string(value: &serde_json::Value) -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-fn json_value_to_original_string(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_value_to_original_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) => Some(clean_original_text(value)),
         serde_json::Value::Number(value) => Some(value.to_string()),

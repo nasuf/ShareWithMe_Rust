@@ -1,9 +1,13 @@
+//! Semantic article blocks (paragraphs, headings, lists, images, captions)
+//! from page HTML.
+
 use scraper::{ElementRef, Html, Selector};
 use url::Url;
 
-use crate::content::{ContentBlock, MediaAsset, OriginalContent};
-
-use super::classify::clean_original_text;
+use crate::{
+    content::{ContentBlock, MediaAsset, OriginalContent},
+    text::clean_original_text,
+};
 
 const MAX_BLOCKS: usize = 300;
 const MAX_TEXT_CHARS: usize = 40_000;
@@ -30,7 +34,7 @@ pub(super) fn document_from_fragment(
 // Extract semantic blocks and media from a specific root element. Dedicated
 // adapters (e.g. WeChat `#js_content`) reuse this so lazy-image and block logic
 // stays in one place.
-pub(super) fn document_from_root(
+pub(crate) fn document_from_root(
     root: ElementRef<'_>,
     base_url: &str,
 ) -> (OriginalContent, Vec<MediaAsset>) {

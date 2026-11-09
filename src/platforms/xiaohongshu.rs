@@ -1,3 +1,5 @@
+//! 小红书 (Xiaohongshu / rednote): notes from the server-rendered page state.
+
 use regex::Regex;
 use serde_json::Value;
 use url::Url;
@@ -5,15 +7,74 @@ use url::Url;
 use crate::{
     content::{MediaAsset, OriginalContent},
     models::LinkMetadata,
+    text::{clean_original_text, clean_text, is_url_only_text},
 };
 
-use super::super::classify::{clean_original_text, clean_text, is_url_only_text};
+use super::identity::id_after;
 
-pub(in crate::analysis) fn merge(metadata: &mut LinkMetadata, html: &str) -> bool {
-    if metadata.platform != "小红书" && !metadata.final_url.contains("xiaohongshu.com") {
-        return false;
+pub(crate) const LOGIN_WALL_REASON: &str =
+    "小红书只返回了登录页面，未取得笔记正文，已保存分享文字。";
+pub(crate) const DEAD_END_REASON: &str =
+    "小红书分享链接已失效或笔记不可见，未取得笔记正文，已保存分享文字。";
+
+/// Note pages and share short links, including the rednote.com domain that
+/// overseas IPs are redirected to.
+pub(crate) fn is_host(host: &str) -> bool {
+    let host = host.trim_start_matches("www.").to_ascii_lowercase();
+    [
+        "xiaohongshu.com",
+        "xhslink.com",
+        "xhslink.cn",
+        "rednote.com",
+    ]
+    .iter()
+    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+pub(super) fn is_media_host(host: &str) -> bool {
+    host.contains("xhscdn.com") || host.contains("xiaohongshu.com")
+}
+
+pub(super) fn identity(segments: &[&str]) -> Option<(String, String)> {
+    id_after(segments, &["explore", "item"]).map(|id| {
+        (
+            id.clone(),
+            format!("https://www.xiaohongshu.com/explore/{id}"),
+        )
+    })
+}
+
+/// `https://www.xiaohongshu.com/login?redirectPath=<note url>` (or the
+/// rednote.com equivalent) -> the note URL, when it points at a note.
+pub(crate) fn login_redirect_target(raw_url: &str) -> Option<String> {
+    let url = Url::parse(raw_url).ok()?;
+    if !is_host(url.host_str()?) || !url.path().starts_with("/login") {
+        return None;
     }
+    let target = url
+        .query_pairs()
+        .find(|(key, _)| key == "redirectPath")
+        .map(|(_, value)| value.into_owned())?;
+    let mut target = Url::parse(&target).ok()?;
+    let is_note = target.host_str().is_some_and(is_host)
+        && (target.path().starts_with("/discovery/item/")
+            || target.path().starts_with("/explore/"));
+    if !is_note {
+        return None;
+    }
+    let _ = target.set_scheme("https");
+    Some(target.into())
+}
 
+/// Expired share token or hidden note: `/404/sec_...`.
+pub(crate) fn is_dead_end(raw_url: &str) -> bool {
+    Url::parse(raw_url)
+        .is_ok_and(|url| url.host_str().is_some_and(is_host) && url.path().starts_with("/404"))
+}
+
+/// Merge a note page. Returns `true` when the page was recognised (a note or
+/// the "note unavailable" page).
+pub(super) fn merge(metadata: &mut LinkMetadata, html: &str) -> bool {
     if html.contains("当前笔记暂时无法浏览") || html.contains("你访问的页面不见了")
     {
         let reason = "小红书返回了笔记不可浏览页面，后端无法抓取该笔记正文。请换一个可公开访问的分享链接，或从原 App 分享带标题/正文的文本。";

@@ -4,13 +4,14 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
+    extraction::is_blocked_without_content,
     models::{AnalyzerCheckResponse, LinkAnalysis, LinkItem, LinkMetadata},
     state::AppState,
+    text::truncate_chars,
 };
 
 use super::classify::{
     extract_entities, extract_keywords, fallback_summary, infer_category, infer_content_type,
-    is_blocked_without_content, truncate_chars,
 };
 
 const MAX_AI_CONTENT_CHARS: usize = 24_000;

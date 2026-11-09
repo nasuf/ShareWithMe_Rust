@@ -1,3 +1,6 @@
+//! Links in API requests: pull URLs out of share-sheet text and reject
+//! destinations the server must not fetch (private, local, non-HTTP).
+
 use regex::Regex;
 use url::{Host, Url};
 

@@ -1,50 +1,25 @@
-use std::env;
+//! oEmbed lookups (YouTube, X, Instagram).
 
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use url::Url;
 
-use crate::{content::MediaAsset, models::LinkMetadata};
+use crate::{
+    models::LinkMetadata,
+    text::{clean_original_text, clean_text, truncate_chars},
+};
 
-use super::super::classify::{clean_original_text, clean_text, truncate_chars};
+use super::UNTITLED;
 
-pub(super) async fn enrich(metadata: &mut LinkMetadata, http: &Client) {
-    let result = match metadata.platform.as_str() {
-        "YouTube" => {
-            fetch(
-                http,
-                "https://www.youtube.com/oembed",
-                &metadata.final_url,
-                None,
-            )
-            .await
-        }
-        "X" => {
-            fetch(
-                http,
-                "https://publish.x.com/oembed",
-                &metadata.final_url,
-                None,
-            )
-            .await
-        }
-        "Instagram" => {
-            let token = env::var("INSTAGRAM_OEMBED_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty());
-            fetch(
-                http,
-                "https://graph.facebook.com/v25.0/instagram_oembed",
-                &metadata.final_url,
-                token.as_deref(),
-            )
-            .await
-        }
-        _ => None,
-    };
-
-    let Some(value) = result else {
+/// Query an oEmbed `endpoint` for the snapshot's URL and merge the result.
+pub(crate) async fn enrich(
+    metadata: &mut LinkMetadata,
+    http: &Client,
+    endpoint: &str,
+    access_token: Option<&str>,
+) {
+    let Some(value) = fetch(http, endpoint, &metadata.final_url, access_token).await else {
         return;
     };
     if merge(metadata, &value) {
@@ -90,8 +65,8 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
         .map(str::to_string)
         .filter(|value| value.starts_with("http"))
     {
-        metadata.image_url = Some(thumbnail.clone());
-        push_media(metadata, thumbnail);
+        metadata.add_image(&thumbnail);
+        metadata.image_url = Some(thumbnail);
         changed = true;
     }
     if let Some(html) = string(value, "html") {
@@ -100,13 +75,11 @@ fn merge(metadata: &mut LinkMetadata, value: &Value) -> bool {
             && text.chars().count() >= metadata.original_text.chars().count()
             && !text.is_empty()
         {
-            metadata.original_text = text.clone();
-            metadata.content_text = clean_text(&text);
-            metadata.original_content = crate::content::OriginalContent::from_plain_text(text);
+            metadata.set_body(text);
             changed = true;
         }
     }
-    if metadata.title == "未命名链接" && !metadata.original_text.trim().is_empty() {
+    if metadata.title == UNTITLED && !metadata.original_text.trim().is_empty() {
         metadata.title = truncate_chars(&metadata.original_text, 80);
     }
     changed
@@ -130,18 +103,6 @@ fn embed_text(html: &str) -> String {
             .unwrap_or_else(|| document.root_element().text().collect::<Vec<_>>().join(" "))
             .trim(),
     )
-}
-
-fn push_media(metadata: &mut LinkMetadata, url: String) {
-    if metadata.media.iter().any(|asset| asset.url == url) {
-        return;
-    }
-    metadata.media.push(MediaAsset {
-        kind: "image".to_string(),
-        url,
-        alt: Some(metadata.title.clone()),
-        ..MediaAsset::default()
-    });
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
